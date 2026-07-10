@@ -2,3 +2,16 @@
 # ('#'로 시작하는 파일명은 첫 글자를 escape 해야 함)
 \## Information Extraction.txt
 공통과제.txt
+
+# HuggingFace 다운로드 캐시
+docred_data/.cache/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# OS
+.DS_Store

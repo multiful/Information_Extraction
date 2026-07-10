@@ -1,0 +1,25 @@
+# Core data / ML stack for loading DocRED and building RE baselines
+numpy==2.0.2
+pandas==2.3.3
+scipy==1.13.1
+scikit-learn==1.6.1
+
+# Dataset loading (docred_data/docred.py uses the HF `datasets` loader)
+datasets==4.5.0
+huggingface_hub==0.36.2
+pyarrow==21.0.0
+
+# Modeling
+torch==2.8.0
+transformers==4.57.6
+tokenizers==0.22.2
+accelerate==1.10.1
+
+# NLP utilities
+nltk==3.9.2
+
+# Analysis / notebooks
+matplotlib==3.9.4
+tqdm==4.67.3
+jupyter==1.1.1
+ipykernel==6.31.0
