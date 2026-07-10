@@ -1,0 +1,4 @@
+# 로컬 과제/메모 txt 파일 무시
+# ('#'로 시작하는 파일명은 첫 글자를 escape 해야 함)
+\## Information Extraction.txt
+공통과제.txt
