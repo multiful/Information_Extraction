@@ -1,7 +1,8 @@
 # CLAUDE.md
 
-> **최종 업데이트**: 2026-07-10
-> **요약**: `docred_data`의 `.json.gz` 원본 압축 해제 및 정리, 압축 해제 산출물 `.gitignore` 처리, `requirements.txt` 작성.
+> **최종 업데이트**: 2026-07-10: 
+> 작성하는 md 파일에는 최종 업데이트 날짜와 요약을 작성해야함. 
+> 요약 예시 : `docred_data`의 `.json.gz` 원본 압축 해제 및 정리, 압축 해제 산출물 `.gitignore` 처리, `requirements.txt` 작성.
 
 ## 프로젝트 개요
 
