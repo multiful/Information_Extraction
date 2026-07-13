@@ -15,3 +15,12 @@ venv/
 
 # OS
 .DS_Store
+
+# Trained model checkpoints/logs/predictions (large or regenerable, via Scripts/models/*_train.py)
+Scripts/models/**/checkpoints/
+Scripts/models/*_checkpoints/
+Scripts/models/logs/
+Scripts/models/predictions/
+*.pt
+Scripts/models/*.log
+Scripts/models/dk_filtered_distant.json
