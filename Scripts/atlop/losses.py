@@ -67,3 +67,47 @@ class ATLoss(nn.Module):
         # Rows with no relation above threshold -> predict Na (class 0).
         output[:, 0] = (output.sum(1) == 0).to(logits)
         return output
+
+
+class PUATLoss(ATLoss):
+    """PU(positive-unlabeled)-style variant of ATLoss for train_distant.
+
+    Motivation (measured on this dataset, see Scripts/models/EXPERIMENTS.md and
+    the track-3 problem-definition analysis): re-running the distant labeling
+    function (Wikidata fact matching) over dev shows 62.2% of human-annotated
+    relations come out as "Na" — i.e. most Na labels in train_distant are
+    *unlabeled*, not confirmed negatives. Under plain ATLoss, every such pair
+    feeds Part 2 ("rank TH above every negative") with a false target, actively
+    training the threshold to sit above true relations.
+
+    Fix, kept deliberately minimal (same simplification A/B-validated on the
+    track-1 model — TTM-RE 2024's core intuition without its nnPU risk
+    estimator): down-weight Part 2 by `na_weight` for pairs whose distant label
+    is all-Na. Pairs with >=1 distant positive are untouched, and Part 1 is
+    untouched. na_weight=1.0 is exactly ATLoss."""
+
+    def __init__(self, na_weight: float = 0.5):
+        super().__init__()
+        self.na_weight = na_weight
+
+    def forward(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        th_label = torch.zeros_like(labels, dtype=torch.float)
+        th_label[:, 0] = 1.0
+        labels = labels.clone().float()
+        labels[:, 0] = 0.0
+
+        p_mask = labels + th_label
+        n_mask = 1 - labels
+
+        logit1 = logits - (1 - p_mask) * 1e30
+        loss1 = -(F.log_softmax(logit1, dim=-1) * labels).sum(1)
+
+        logit2 = logits - (1 - n_mask) * 1e30
+        loss2 = -(F.log_softmax(logit2, dim=-1) * th_label).sum(1)
+
+        # Down-weight the TH-ranking term only where the distant label is
+        # all-Na (an *unlabeled* pair, not a trusted negative).
+        is_na = labels.sum(1) == 0
+        w2 = torch.where(is_na, torch.full_like(loss2, self.na_weight),
+                         torch.ones_like(loss2))
+        return (loss1 + w2 * loss2).mean()

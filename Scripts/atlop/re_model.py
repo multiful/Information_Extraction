@@ -25,12 +25,14 @@ from .long_input import process_long_input
 
 class DocREModel(nn.Module):
     def __init__(self, config, encoder, emb_size: int = 768, block_size: int = 64,
-                 num_labels: int = 97, offset: int = 1):
+                 num_labels: int = 97, offset: int = 1, loss_fnt: nn.Module = None):
         super().__init__()
         self.config = config
         self.encoder = encoder
         self.hidden_size = config.hidden_size
-        self.loss_fnt = ATLoss()
+        # Injectable so train_re can swap in losses.PUATLoss for distant
+        # pretraining; default unchanged (plain ATLoss).
+        self.loss_fnt = loss_fnt if loss_fnt is not None else ATLoss()
 
         self.head_extractor = nn.Linear(2 * config.hidden_size, emb_size)
         self.tail_extractor = nn.Linear(2 * config.hidden_size, emb_size)

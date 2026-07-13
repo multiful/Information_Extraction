@@ -18,6 +18,7 @@ added; the model adds a `+offset` (1 for the leading [CLS]) when indexing.
 
 import sys
 from pathlib import Path
+from typing import Optional
 
 from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
@@ -90,7 +91,7 @@ def _encode_with_markers(doc: dict, tokenizer: PreTrainedTokenizerBase):
 def build_features(
     docs,
     tokenizer: PreTrainedTokenizerBase,
-    rel2id: dict[str, int] | None = None,
+    rel2id: Optional[dict] = None,  # dict[str, int]; Optional for Python 3.9 (X | None is 3.10+)
     show_progress: bool = True,
 ) -> list[dict]:
     """Turn an iterable of raw DocRED docs into ATLOP feature dicts.
