@@ -2,9 +2,10 @@
 
 > **최종 업데이트**: 2026-07-13: distant 라벨의 62.2% false-negative가 ATLoss의 TH(임계값) 학습을
 > 오염시키는 문제를 데이터→수식→모델 3단계로 규명. ATLOP baseline에 PUATLoss를 추가해 A/B 검증 —
-> na_weight sweep(1.0/0.7/0.5/0.3) 결과 **0.7이 최적** (dev F1 44.63→47.56, Ign 42.59→45.07).
-> na_weight=0.5 기준으로도 dev 정답 관계 1,415개(11.5%)가 임계값 아래에서 구출됨(순이득 +1,238).
-> 실험은 distant 5,000개 subset·CPU·single seed(66)·stage-1 한정 — Colab 풀 스케일 A/B는 0.7로 권장.
+> na_weight sweep(1.0/0.7/0.5/0.3) 결과 **0.7이 최적** (stage-1 dev F1 44.63→47.56). **Colab A100
+> 풀 파이프라인(distant 2만 + annotated 15ep)에서 baseline 61.71/59.86 → 62.06/60.16으로 이득이
+> 파인튜닝 후에도 유지됨을 확인** (단, +0.35는 seed 변동폭 이내 — §4 참고). dev 정답 1,415개가
+> 임계값 아래에서 구출됨(na_weight=0.5, 5천개 기준, 순이득 +1,238).
 
 ## 1. 문제정의: 적응형 임계값은 distant 라벨의 거짓말을 그대로 배운다
 
@@ -112,10 +113,29 @@ python -m Scripts.atlop.train_re --distant_mode pretrain --distant_limit 5000 \
 - **Colab 풀 스케일 A/B는 na_weight=0.7로 진행 권장** (stage-1 F1/Ign F1 모두 최고 + P/R 균형이
   가장 좋아 annotated fine-tune에서 precision 회복 부담도 가장 적음).
 
-## 4. 한계 및 다음 단계
+## 4. 풀 파이프라인 검증 (Colab A100, `colab_pu07_reproduce.ipynb`)
 
-- **한계**: distant 5,000개 subset(전체의 4.9%), 1 epoch, CPU, single seed(66), stage-1(distant)만 —
-  annotated fine-tune 후에도 이득이 유지되는지 미확인 (dk 모델 실험 2에서는 유지됐음: 0.5686→0.5710).
-- **다음 단계**: ① Colab에서 distant 20,000개 + annotated fine-tune까지 풀 파이프라인 A/B
-  (팀원 baseline 학습 레시피와 동일 조건, `--use_pu_loss --na_weight 0.7`), ② 여력이 되면 TTM-RE의
-  클래스 prior 기반 risk estimator로 확장 검토.
+distant 20,000개 PU(0.7) 프리트레인 → annotated 15 epoch 파인튜닝. 비교군은 팀원 baseline
+`atlop`(완전 동일 레시피·seed 66, PU만 꺼짐 — `results/comparison.md`):
+
+| | dev F1 | Ign F1 | P | R |
+|---|---|---|---|---|
+| baseline (PU off) | 61.71 | 59.86 | 66.08 | 57.89 |
+| **PU na_weight=0.7** | **62.06** | **60.16** | 65.23 | 59.18 |
+| 차이 | +0.35 | +0.30 | −0.85 | +1.29 |
+
+- stage-1(distant 직후) 시점: dev F1 52.92 / Ign 50.23 — 로컬 5천개(47.56)보다 크게 높아
+  데이터 규모 효과 확인.
+- **결론**: stage-1의 큰 이득(+2.93, 5천개 기준)이 annotated 파인튜닝을 거치며 +0.35로 줄지만
+  방향은 유지 — dk 모델 실험 2(+4.6→+0.24)와 동일한 패턴 재현. recall 우위(+1.29)가 최종까지
+  남는 것이 PU 메커니즘("눌린 정답 구출")의 시그니처.
+- **주의**: +0.35는 PRD §5의 seed 변동폭(±1점) 이내 — single seed로 "확정 우위" 주장은 불가.
+  확정하려면 2 seed 평균 필요. 참고로 62.06/60.16은 현재 팀 비교표 1위(트랙1 dk 61.77/59.98,
+  ATLOP 논문 61.09/59.22).
+
+## 5. 한계 및 다음 단계
+
+- **한계**: single seed(66); 스크리닝(na_weight sweep)은 distant 5,000개·stage-1 기준이라 풀
+  파이프라인에서의 na_weight 최적값은 미검증(0.7만 풀 런 완료).
+- **다음 단계**: ① seed 1개 추가로 2-seed 평균 확정, ② 여력이 되면 TTM-RE의 클래스 prior 기반
+  risk estimator(정식 nnPU)로 확장 검토.
