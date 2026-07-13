@@ -1,9 +1,10 @@
 # 트랙 3: Adaptive Thresholding 고도화 — 문제정의 및 PU Loss 실험
 
 > **최종 업데이트**: 2026-07-13: distant 라벨의 62.2% false-negative가 ATLoss의 TH(임계값) 학습을
-> 오염시키는 문제를 데이터→수식→모델 3단계로 규명. ATLOP baseline에 PUATLoss(na_weight=0.5)를
-> 추가해 A/B 검증 — dev F1 44.63→46.10, Recall +10.1p, dev 정답 관계 1,415개(11.5%)가 임계값
-> 아래에서 구출됨(순이득 +1,238). 실험은 distant 5,000개 subset·CPU·single seed(66)·stage-1 한정.
+> 오염시키는 문제를 데이터→수식→모델 3단계로 규명. ATLOP baseline에 PUATLoss를 추가해 A/B 검증 —
+> na_weight sweep(1.0/0.7/0.5/0.3) 결과 **0.7이 최적** (dev F1 44.63→47.56, Ign 42.59→45.07).
+> na_weight=0.5 기준으로도 dev 정답 관계 1,415개(11.5%)가 임계값 아래에서 구출됨(순이득 +1,238).
+> 실험은 distant 5,000개 subset·CPU·single seed(66)·stage-1 한정 — Colab 풀 스케일 A/B는 0.7로 권장.
 
 ## 1. 문제정의: 적응형 임계값은 distant 라벨의 거짓말을 그대로 배운다
 
@@ -94,10 +95,27 @@ python -m Scripts.atlop.train_re --distant_mode pretrain --distant_limit 5000 \
 해석(트랙 1 dk 모델의 2만개 실험에서는 동일 메커니즘으로 완전히 뒤집힌 pair들이 다수 확인됨).
 단건 예시보다 3-2의 전수 통계(1,415개 구출)가 본질적 증거.
 
+### 3-4. na_weight sweep (동일 조건: distant 5,000개, 1 epoch, seed 66, stage-1만)
+
+| na_weight | dev F1 | Ign F1 | Precision | Recall |
+|---|---|---|---|---|
+| 1.0 (= 일반 ATLoss) | 44.63 | 42.59 | 54.03 | 38.02 |
+| **0.7** | **47.56** | **45.07** | 49.43 | 45.82 |
+| 0.5 | 46.10 | 43.36 | 44.25 | 48.11 |
+| 0.3 | 46.36 | 43.37 | 38.68 | 57.84 |
+
+- 예상과 달리 단조 관계가 아님: 낮출수록 recall은 계속 오르지만(38→46→48→58) precision 하락이
+  더 가팔라져서, F1 최적점은 **0.7** (F1 +2.93, Ign +2.48 vs 일반 ATLoss — 0.5/0.3보다도 우위).
+- 해석: FN이 62%라도 Na 라벨의 38%는 진짜 음성이므로, TH-랭킹 신호를 절반 이하로 꺾으면(0.5↓)
+  진짜 음성에서 오는 정상 학습 신호까지 손상 → 과하게 낮아진 임계값이 precision을 무너뜨림.
+  0.7은 "의심은 하되 신호는 유지"하는 지점.
+- **Colab 풀 스케일 A/B는 na_weight=0.7로 진행 권장** (stage-1 F1/Ign F1 모두 최고 + P/R 균형이
+  가장 좋아 annotated fine-tune에서 precision 회복 부담도 가장 적음).
+
 ## 4. 한계 및 다음 단계
 
 - **한계**: distant 5,000개 subset(전체의 4.9%), 1 epoch, CPU, single seed(66), stage-1(distant)만 —
   annotated fine-tune 후에도 이득이 유지되는지 미확인 (dk 모델 실험 2에서는 유지됐음: 0.5686→0.5710).
 - **다음 단계**: ① Colab에서 distant 20,000개 + annotated fine-tune까지 풀 파이프라인 A/B
-  (팀원 baseline 학습 레시피와 동일 조건), ② na_weight sweep(0.3/0.5/0.7), ③ 여력이 되면 TTM-RE의
+  (팀원 baseline 학습 레시피와 동일 조건, `--use_pu_loss --na_weight 0.7`), ② 여력이 되면 TTM-RE의
   클래스 prior 기반 risk estimator로 확장 검토.
