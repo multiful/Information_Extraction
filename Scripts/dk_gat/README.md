@@ -3,21 +3,30 @@
 > **최종 업데이트**: 2026-07-14 (Gated Fusion / Bilinear Classifier / abs-diff 구현 + 학습 전략
 > 플래그 추가, 전부 토글식 — A/B 검증 전까지 기본값은 변경 없음):
 >
-> **JK A/B 1차 결과 (distant 3,000문서 스크리닝)**: JK off가 JK on보다 우세 (F1 26.77 vs 25.32,
-> Ign 25.81 vs 24.60) — 다만 Gated Fusion이 JK의 결합 단계를 대체하는 관계라(코드 주석 참고),
-> 최종 채택 여부는 Gated Fusion A/B 결과까지 보고 함께 결정 예정. 지금은 JK 기본값(on) 유지.
+> **✅ Gated Fusion A/B 결론 (distant 3,000문서 스크리닝, 2026-07-14 15:29 완료) — 채택 확정**:
 >
-> **⭐ Gated Fusion** (`--use_gated_fusion`, 기본 off): GAT 출력과 원본(pre-GAT) 엔티티 임베딩을
-> 학습 가능한 per-dimension sigmoid 게이트로 blend — `gate=sigmoid(W[e_orig;e_gat])`,
-> `g=gate*e_gat+(1-gate)*e_orig`. GAT 메시지패싱이 강한 엔티티 표현을 이웃과 평균내며 희석시킬 수
-> 있다는 우려에 대응, JK의 max 결합 대신 학습된 결합을 씀 (JK보다 우선 적용). A/B 진행 중
-> (`logs/gate_ab.log`).
+> | 설정 | dev F1 | Ign F1 | Precision | Recall |
+> |---|---|---|---|---|
+> | baseline (JK on, gate 없음) | 25.16 | 24.45 | 59.50 | 15.95 |
+> | **Gated Fusion** | **27.38** | **26.47** | 56.50 | 18.07 |
+>
+> F1 +2.2 / Ign F1 +2.0 (precision 소폭 하락하지만 recall 개선폭이 커 순이익). 앞서 나온 JK
+> on/off 스크리닝 결과(F1 26.77 vs 25.32)보다도 둘 다 앞섬 — Gated Fusion이 JK의 결합 단계를
+> 코드상 완전히 대체하므로(`use_gated_fusion`이 `use_jk`보다 우선 적용, 둘을 스택하지 않음)
+> **JK on/off 논쟁 자체가 무의미해짐**. **다음 전체 Colab 실행부터 `--use_gated_fusion` 필수
+> 추가로 결론.**
+>
+> **⭐ Gated Fusion** (`--use_gated_fusion`, argparse 기본값은 여전히 off — `--use_pu_loss`와
+> 같은 패턴으로, 학습 커맨드에 명시적으로 플래그를 추가하는 방식 유지): GAT 출력과 원본(pre-GAT)
+> 엔티티 임베딩을 학습 가능한 per-dimension sigmoid 게이트로 blend —
+> `gate=sigmoid(W[e_orig;e_gat])`, `g=gate*e_gat+(1-gate)*e_orig`. GAT 메시지패싱이 강한 엔티티
+> 표현을 이웃과 평균내며 희석시킬 수 있다는 우려에 대응, JK의 max 결합 대신 학습된 결합을 씀.
 >
 > **⭐ ATLOP식 Grouped Bilinear Classifier** (`--use_bilinear_classifier`, 기본 off): 기존
 > concat+`g_h*g_t`+MLP 분류 경로를 대체 — head/tail extractor(Linear+tanh) 후 block-wise outer
 > product(12블록×64) → Linear(768*64→97). 학습 곡선이 정상(loss 꾸준히 감소, 불안정 없음)이라 GAT
 > 자체보다 분류기 용량이 병목일 가능성에 대응. interaction term과 중복이라 대체(스택 안 함).
-> A/B 대기 중 (`logs/bilinear_ab.log`, Gated Fusion A/B 완료 후 자동 시작).
+> A/B 진행 중 (`logs/bilinear_ab.log`, Gated Fusion A/B 완료 후 자동 시작됨).
 >
 > **⭐ Pair Representation에 `abs(g_h-g_t)` 추가** (`--use_abs_diff`, 기본 off): 기존
 > `[g_h;g_t;g_h*g_t;c_ht]`에 InferSent 스타일 절대차 항을 추가 — 곱 항이 못 잡는 "head/tail 특징
