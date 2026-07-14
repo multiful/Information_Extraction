@@ -50,6 +50,7 @@ sys.path.insert(0, str(ROOT))
 
 from data.docred_dataset import DocREDataset          # noqa: E402
 from data.docred_io import build_rel2id, NUM_CLASSES   # noqa: E402
+from Scripts.atlop.losses import ATLoss, PUATLoss       # noqa: E402
 from Scripts.atlop.preprocess import build_features     # noqa: E402
 from Scripts.atlop.re_model import DocREModel           # noqa: E402
 from Scripts.eval.scorer import evaluate                # noqa: E402
@@ -270,15 +271,29 @@ def train(args):
         distant_docs, distant_features = load_distant()
         print(f"[stage 1] distant pretrain on {len(distant_docs)} docs "
               f"({args.distant_epochs} epoch(s))")
+        if args.use_pu_loss:
+            # PU loss only makes sense on distant data (its Na labels are
+            # unlabeled, not gold negatives) -- swapped back before stage 2.
+            model.loss_fnt = PUATLoss(na_weight=args.na_weight)
+            print(f"[stage 1] loss = PUATLoss(na_weight={args.na_weight})")
         distant_loader = DataLoader(distant_features, batch_size=args.distant_batch_size,
                                     shuffle=True, collate_fn=collate)
-        run_stage(model, distant_loader, args, device, args.distant_epochs,
-                  "distant-pretrain", dev_loader, dev_docs, train_docs, id2rel)
+        metrics, preds = run_stage(model, distant_loader, args, device, args.distant_epochs,
+                                   "distant-pretrain", dev_loader, dev_docs, train_docs, id2rel)
         del distant_features, distant_loader, distant_docs
+        if args.save_model:
+            RESULTS_DIR.mkdir(exist_ok=True)
+            stage1_ckpt = RESULTS_DIR / f"{args.run_name}_stage1.pt"
+            torch.save(model.state_dict(), stage1_ckpt)
+            print(f"[saved] {stage1_ckpt}  (distant-pretrain checkpoint)")
+        model.loss_fnt = ATLoss()
 
-        print(f"[stage 2] annotated fine-tune on {len(train_docs)} docs ({args.epochs} epoch(s))")
-        metrics, preds = run_stage(model, train_loader, args, device, args.epochs,
-                                   "annotated-finetune", dev_loader, dev_docs, train_docs, id2rel)
+        if args.epochs > 0:
+            print(f"[stage 2] annotated fine-tune on {len(train_docs)} docs ({args.epochs} epoch(s))")
+            metrics, preds = run_stage(model, train_loader, args, device, args.epochs,
+                                       "annotated-finetune", dev_loader, dev_docs, train_docs, id2rel)
+        else:
+            print("[stage 2] skipped (--epochs 0) -- reporting stage-1 metrics/predictions")
     else:
         # Team recipe: supervised training on the clean annotated split first.
         # In denoise mode this model doubles as the teacher for stage 2.
@@ -336,6 +351,11 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--distant_batch_size", type=int, default=4)
     p.add_argument("--distant_limit", type=int, default=0,
                    help="cap distant docs (0 = all 101,873; use e.g. 20000 to bound RAM/time on Colab)")
+    p.add_argument("--use_pu_loss", action="store_true",
+                   help="use losses.PUATLoss for the distant pretrain stage (pretrain mode only; "
+                        "annotated fine-tune always uses plain ATLoss since its Na labels are gold)")
+    p.add_argument("--na_weight", type=float, default=0.5,
+                   help="PUATLoss down-weight for the TH-ranking term on distant all-Na pairs")
     p.add_argument("--encoder_lr", type=float, default=5e-5)
     p.add_argument("--classifier_lr", type=float, default=1e-4)
     p.add_argument("--warmup_ratio", type=float, default=0.06)
