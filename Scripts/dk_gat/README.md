@@ -40,10 +40,33 @@
 > Linear(768*64→97). 학습 곡선이 정상(loss 꾸준히 감소, 불안정 없음)이라 GAT 자체보다 분류기
 > 용량이 병목일 가능성에 대응. interaction term과 중복이라 대체(스택 안 함).
 >
+> **✅ abs-diff A/B 결론 (distant 3,000문서 스크리닝, 2026-07-14 16:27 완료) — 단독으로는 이기지만
+> 최종 조합에서는 무의미**:
+>
+> | 설정 | dev F1 | Ign F1 | Precision | Recall |
+> |---|---|---|---|---|
+> | baseline (abs-diff 없음) | 25.20 | 24.49 | 59.51 | 15.98 |
+> | **abs-diff 추가** | **27.92** | **26.95** | 57.77 | 18.41 |
+>
+> F1 +2.72 / Ign F1 +2.46 — MLP+interaction 경로 단독으로 보면 확실한 개선. **하지만**
+> `use_bilinear_classifier`가 켜지면 `pair_proj` MLP 경로 자체를 안 타므로 `use_abs_diff`는
+> 완전히 무시됨(코드: `forward()`의 `if self.use_bilinear_classifier: ... else: (abs-diff는 여기
+> 안에서만 적용)`). 이미 Bilinear Classifier(F1 28.79)가 abs-diff(27.92)보다도 앞서 채택
+> 확정됐으므로, **JK가 Gated Fusion으로 무의미해진 것과 같은 패턴 — 최종 추천 조합에서 abs-diff는
+> 넣으나 안 넣으나 결과가 같음(bilinear 경로에서 그냥 무시되는 죽은 플래그)**. `--use_abs_diff`는
+> 넣지 않음.
+>
 > **⭐ Pair Representation에 `abs(g_h-g_t)` 추가** (`--use_abs_diff`, 기본 off): 기존
 > `[g_h;g_t;g_h*g_t;c_ht]`에 InferSent 스타일 절대차 항을 추가 — 곱 항이 못 잡는 "head/tail 특징
-> 크기 차이" 신호. bilinear classifier 사용 시엔 무시(그 경로는 pair_proj를 안 씀). A/B 대기 중
-> (`logs/absdiff_ab.log`, Bilinear A/B 완료 후 자동 시작).
+> 크기 차이" 신호. bilinear classifier 사용 시엔 무시(그 경로는 pair_proj를 안 씀).
+>
+> ---
+>
+> **🏁 A/B 큐 최종 결론 — 다음 전체 Colab 실행(distant_limit=20000, epochs=15)에 반영할 조합**:
+> `--use_gated_fusion --use_bilinear_classifier` (abs-diff/JK는 위 이유로 미포함).
+> 학습 전략 플래그(`--lr2`/`--layerwise_lr_decay`/`--freeze_encoder_epochs`/
+> `--evidence_start_epoch`/`--early_stop_patience`)는 CPU 스크리닝으로 검증 불가능한 항목이라
+> 이번 실행엔 미포함, 사용자 확인 후 결정.
 >
 > **학습 전략 플래그 (신규, 기본값은 전부 현재 동작 그대로 — off/미변경)**: `--lr2`(stage2 전용
 > learning rate, 미지정 시 `--lr`과 동일), `--layerwise_lr_decay`(BERT 층별 LR 감쇠, 1.0=비활성),
