@@ -101,3 +101,45 @@ class PairGATLayer(nn.Module):
         att = self.dropout(torch.softmax(scores, dim=-1))
         out = (att @ v).transpose(0, 1).reshape(m, -1)             # (m, dim)
         return self.norm(x + self.dropout(self.out(out)))
+
+
+class HeteroGATLayer(nn.Module):
+    """Multi-head GAT over a heterogeneous *node* graph (Entity/Mention/Sentence),
+    used by the rebuilt integrated model (re_model_full.DocREModelFull).
+
+    Same masked dot-product attention as PairGATLayer, generalized to an
+    arbitrary number of typed edge sets so heads can specialize per relation
+    (e.g. one head favouring mention->sentence, another coreference edges).
+    Attention is masked to the union of every edge type's neighbors plus self,
+    softmax-normalized, and applied as a residual + LayerNorm update. Works on
+    one document's node set at a time (N nodes ~ mentions+entities+sentences).
+    """
+
+    def __init__(self, dim: int, n_edge_types: int, heads: int = 4, dropout: float = 0.1):
+        super().__init__()
+        assert dim % heads == 0, "graph_dim must be divisible by graph_heads"
+        self.heads = heads
+        self.head_dim = dim // heads
+        self.qkv = nn.Linear(dim, 3 * dim)
+        self.out = nn.Linear(dim, dim)
+        self.type_bias = nn.Parameter(torch.zeros(n_edge_types, heads))
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
+        """x: (N, dim) node features. adj: (n_edge_types, N, N) bool typed
+        adjacency (symmetric, self-loops excluded). Returns (N, dim)."""
+        n = x.size(0)
+        q, k, v = self.qkv(x).chunk(3, dim=-1)
+        q = q.view(n, self.heads, self.head_dim).transpose(0, 1)   # (H, N, d_h)
+        k = k.view(n, self.heads, self.head_dim).transpose(0, 1)
+        v = v.view(n, self.heads, self.head_dim).transpose(0, 1)
+
+        scores = q @ k.transpose(-2, -1) / self.head_dim ** 0.5    # (H, N, N)
+        scores = scores + torch.einsum("kmn,kh->hmn", adj.to(x.dtype), self.type_bias)
+        allowed = adj.any(0) | torch.eye(n, dtype=torch.bool, device=x.device)
+        scores = scores.masked_fill(~allowed.unsqueeze(0), float("-inf"))
+
+        att = self.dropout(torch.softmax(scores, dim=-1))
+        out = (att @ v).transpose(0, 1).reshape(n, -1)             # (N, dim)
+        return self.norm(x + self.dropout(self.out(out)))
