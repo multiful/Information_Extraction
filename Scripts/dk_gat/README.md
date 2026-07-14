@@ -1,6 +1,24 @@
 # dk EGAT 모델 — 제안 아키텍처 파이프라인 문서
 
-> **최종 업데이트**: 2026-07-14 (`dk_gat`(Gated Fusion + Bilinear Classifier) 실행 완료 확인 —
+> **최종 업데이트**: 2026-07-14 (**Entity-Pair Graph 신규 추가** — A→B,B→C⇒A→C 합성 추론을
+> 직접 겨냥, `dk_gat_v2`에 반영): `Scripts/atlop`의 별도 트랙(`re_model_gat.py` 등, 팀원 관할이라
+> 미수정)과 상의하며 나온 통찰을 dk_gat 자체에 반영 — 지금까지 dk_gat의 Entity+Sentence GAT는
+> **엔티티 임베딩만 보강**할 뿐, "쌍 (a,b)가 지금 어떤 관계로 예측되는지"를 다른 쌍이 직접 읽는
+> 경로가 없었음. 이를 겨냥해 **두 번째 그래프 단계**를 추가:
+>
+> - **노드 = (h,t) 쌍 자체** (엔티티 아님). `same-head`/`same-tail`/`bridge-succ`/`bridge-pred`
+>   4타입 엣지로 연결 — bridge를 방향성 있게 분리해 "내가 체인의 선행/후행 쌍인지"를 구분.
+> - **관계-조건부 메시지**: 이 쌍의 provisional 관계 예측(logits)을 노드 특징에 얹어서, (a,c)가
+>   (a,b)/(b,c)의 "현재 어떤 관계로 보이는지"를 직접 읽을 수 있게 함 — father_of+father_of면
+>   grandfather_of라는 합성에 필요한 신호.
+> - `pair_graph_out`이 **zero-init**이라 껐을 때(`--use_pair_graph` 미지정)와 완전히 동일한
+>   동작 보장 — CPU에서 zero-init parity 직접 검증 완료(같은 seed로 pair-graph 켜고 끈 두
+>   모델의 logits/loss가 소수점까지 동일).
+>
+> `--use_pair_graph --pair_graph_dim 256`(기본값), CPU smoke test(전 플래그 동시 적용)만
+> 통과했고 distant 스크리닝은 생략 — `dk_gat_v2` 실행이 첫 실측.
+>
+> 이전 (`dk_gat`(Gated Fusion + Bilinear Classifier) 실행 완료 확인 —
 > **여전히 baseline보다 낮고, 직전 버전 대비 개선폭도 스크리닝 기대치에 훨씬 못 미침**):
 > 노트북 셀 5가 이미 GPU에서 완료돼 있었음(RTX PRO 6000, A100 아님 — GPU 종류는 무관, 완주는
 > 됨). **결과: dev F1 60.62 / Ign F1 58.69 (best epoch 6, patience=3으로 epoch 9에서 조기
@@ -243,7 +261,7 @@
 | 파일 | 역할 |
 |---|---|
 | `preprocess_gat.py` | atlop의 `*` 마커 방식 확장: 문장 토큰 span, 엔티티+문장 이종 그래프(edge 카테고리/거리/인접행렬), pair별 evidence 집합 |
-| `model.py` | `DocREGATModel` — 인코더/엔티티+문장 풀링/LCP/이종 EGAT 2층(옵션: 엣지 카테고리별 meta-path attention)/interaction pair repr/분류기/ATLoss(주입형)+InfoNCE |
+| `model.py` | `DocREGATModel` — 인코더/엔티티+문장 풀링/LCP/이종 EGAT 2층(옵션: meta-path attention)/interaction pair repr/분류기/**옵션: Entity-Pair Graph 2차 정제**(`use_pair_graph`)/ATLoss(주입형)+InfoNCE |
 | `train_gat.py` | 2단계 학습(distant PUATLoss→annotated ATLoss), best-epoch 체크포인트, `ATLoss.get_label` 디코드, 공통 스코어러 평가 |
 | `colab_gat_a100.ipynb` | Colab A100 원클릭 실행 노트북 |
 
@@ -255,6 +273,7 @@
 - **노드 타입** (Embedding(8, 8) × head/tail): PER/ORG/LOC/TIME/NUM/MISC/unk(엔티티) + 문장 전용 공유 타입 1개
 - **Sparse 인접행렬**: entity-entity는 기존 기준(같은 문장/멘션겹침/거리≤2) 그대로, entity-sentence는 해당 문장에 멘션이 있으면 연결, sentence-sentence 엣지는 없음(엔티티가 공유 문장 노드를 거쳐 2-hop 연결) + self-loop 상시
 - **Meta-path Attention** (`--use_metapath_attention`, 기본 off): 위 4개 엣지 카테고리(self/같은문장/멘션겹침/entity-sentence)마다 GAT attention 벡터 `a`를 독립으로 둘지 여부 — 기본은 전체 공유(기존 동작)
+- **Entity-Pair Graph** (`--use_pair_graph`, 기본 off, `model.py`의 `_build_pair_adjacency`/`EntityPairGATLayer`): 위 엔티티+문장 그래프와는 별개인 **2차 그래프** — 노드가 엔티티가 아니라 이 문서의 (h,t) 쌍 자체. `same-head`/`same-tail`/`bridge-succ`/`bridge-pred` 4타입 엣지로 연결하고, 노드 특징에 엔티티 표현뿐 아니라 그 쌍의 provisional 관계 예측(logits)까지 얹어(관계-조건부 메시지) A→B,B→C⇒A→C 합성을 직접 겨냥. `pair_graph_out`이 zero-init이라 끄면(`--use_pair_graph` 미지정) 완전히 이전과 동일 동작
 
 ## 스펙 대비 구현 해석
 
@@ -302,10 +321,12 @@ freeze_encoder_epochs/curriculum_na_weight)는 CPU smoke test만 통과했고 di
 
 ```bash
 # CPU 정합성 검증 (통과 확인됨, 2026-07-14 -- meta-path attention/curriculum na_weight/
-# layerwise_lr_decay/freeze_encoder_epochs/evidence_start_epoch 전부 동시 적용 후 재검증 완료)
+# layerwise_lr_decay/freeze_encoder_epochs/evidence_start_epoch/entity-pair graph
+# 전부 동시 적용 후 재검증 완료, zero-init parity도 별도 검증)
 python -m Scripts.dk_gat.train_gat --limit_docs 8 --epochs 2 --distant_epochs 1 \
     --use_pu_loss --na_weight 0.7 --use_gated_fusion --use_bilinear_classifier \
     --use_metapath_attention --curriculum_na_weight --na_weight_start 1.0 \
+    --use_pair_graph --pair_graph_dim 64 \
     --lr2 1e-5 --layerwise_lr_decay 0.9 --freeze_encoder_epochs 1 --evidence_start_epoch 1 \
     --early_stop_patience 3
 
@@ -313,6 +334,7 @@ python -m Scripts.dk_gat.train_gat --limit_docs 8 --epochs 2 --distant_epochs 1 
 python -m Scripts.dk_gat.train_gat --distant_limit 20000 --distant_epochs 1 --epochs 15 \
     --use_pu_loss --na_weight 0.7 --curriculum_na_weight --na_weight_start 1.0 \
     --use_gated_fusion --use_bilinear_classifier --use_metapath_attention \
+    --use_pair_graph --pair_graph_dim 256 \
     --lr 2e-5 --lr2 1e-5 --layerwise_lr_decay 0.9 --freeze_encoder_epochs 1 \
     --evidence_start_epoch 2 --early_stop_patience 3 \
     --run_name dk_gat_v2 --save_model --seed 66

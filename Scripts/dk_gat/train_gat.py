@@ -255,7 +255,11 @@ def train(args):
                           use_gated_fusion=args.use_gated_fusion,
                           use_bilinear_classifier=args.use_bilinear_classifier,
                           use_abs_diff=args.use_abs_diff,
-                          use_metapath_attention=args.use_metapath_attention).to(device)
+                          use_metapath_attention=args.use_metapath_attention,
+                          use_pair_graph=args.use_pair_graph,
+                          pair_graph_layers=args.pair_graph_layers,
+                          pair_graph_dim=args.pair_graph_dim,
+                          pair_graph_heads=args.pair_graph_heads).to(device)
 
     stage1_metrics, stage1_preds = None, None
     if args.distant_epochs > 0:
@@ -387,6 +391,20 @@ def build_argparser():
                         "EdgeFeaturedGATLayer's docstring in model.py. Off by default -- "
                         "unlike the other use_* flags this has NOT been distant-screened yet, "
                         "only CPU smoke-tested for crash-freedom; treat as unvalidated")
+    p.add_argument("--use_pair_graph", action="store_true",
+                   help="second graph stage over (h,t) pair-nodes (not entities), directly "
+                        "targeting A->B,B->C=>A->C composition via same-head/same-tail/"
+                        "bridge-succ/bridge-pred edges + relation-conditioned messages (this "
+                        "pair's own provisional logits fed into its node feature) -- see "
+                        "model.py module docstring. zero-init residual head, so it can only "
+                        "help vs the no-pair-graph model. Off by default -- new, CPU "
+                        "smoke-tested only, not distant-screened yet")
+    p.add_argument("--pair_graph_layers", type=int, default=2,
+                   help="pair-graph propagation layers (use_pair_graph only)")
+    p.add_argument("--pair_graph_dim", type=int, default=256,
+                   help="pair-graph node feature dim (use_pair_graph only)")
+    p.add_argument("--pair_graph_heads", type=int, default=4,
+                   help="pair-graph attention heads (use_pair_graph only)")
     p.add_argument("--evidence_weight", type=float, default=0.2)
     p.add_argument("--evidence_start_epoch", type=int, default=0,
                    help="curriculum: evidence contrastive loss is added only from this "

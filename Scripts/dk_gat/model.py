@@ -72,6 +72,20 @@ two effects (loss fix vs. graph/interaction upgrade) aren't conflated.
 Prediction: ATLoss.get_label(logits) -- a relation is emitted iff its logit
 exceeds the learned per-pair TH (class 0) logit, capped at top-4. No global
 threshold to sweep.
+
+Entity-Pair Graph (use_pair_graph, off by default, new -- see the class
+docstrings below for the full rationale): a second, optional graph stage
+whose nodes are (h,t) PAIRS themselves (one node per row of hts), not
+entities. This directly targets the "A->B, B->C explicit in the document,
+A->C must be inferred by composition" gap that the entity+sentence GAT above
+only addresses indirectly (it refines individual entity embeddings by
+mixing in neighborhood context; it has no channel for "pair (a,c) reads what
+pair (a,b) currently predicts"). The pair-graph runs AFTER the provisional
+logits are computed (from either classifier path above) and adds a
+zero-init residual on top, so at initialization the model is exactly the
+no-pair-graph model -- it can only help, never destabilize the existing,
+already-validated pipeline, and any regression is attributable to the graph
+actually hurting rather than to changed initialization.
 """
 
 import sys
@@ -161,13 +175,82 @@ class EdgeFeaturedGATLayer(nn.Module):
         return out
 
 
+PAIR_EDGE_TYPES = 4  # same-head, same-tail, bridge-succ, bridge-pred
+
+
+def _build_pair_adjacency(ht: torch.Tensor) -> torch.Tensor:
+    """ht: (m, 2) long tensor of (head_entity, tail_entity) ids, one row per
+    pair-node -- this document's hts, same order as the logits/labels rows
+    it parallels. Returns a bool (4, m, m) typed adjacency; self-connections
+    removed (self info is handled inside the layer itself).
+
+      type 0  same-head   : (a,b)-(a,c)          h_i == h_j
+      type 1  same-tail   : (a,c)-(b,c)          t_i == t_j
+      type 2  bridge-succ : (a,b) -> (b,c)       t_i == h_j (j continues i's chain)
+      type 3  bridge-pred : (b,c) -> (a,b)       h_i == t_j (j precedes i's chain)
+
+    For the target pair (a,c): its same-head neighbors include premise
+    (a,b), its same-tail neighbors include premise (b,c) -- one propagation
+    layer already lets (a,c) read both premises of an a->b->c chain. The two
+    bridge types (rather than one symmetric `t_i==h_j OR h_i==t_j` type) let
+    the layer tell "I am the first leg of a chain" apart from "I am the
+    second leg" -- composition is directional, a single undirected edge
+    can't distinguish those two roles."""
+    h, t = ht[:, 0], ht[:, 1]
+    same_head = h.unsqueeze(1) == h.unsqueeze(0)
+    same_tail = t.unsqueeze(1) == t.unsqueeze(0)
+    bridge_succ = t.unsqueeze(1) == h.unsqueeze(0)
+    bridge_pred = h.unsqueeze(1) == t.unsqueeze(0)
+    adj = torch.stack([same_head, same_tail, bridge_succ, bridge_pred])
+    eye = torch.eye(ht.size(0), dtype=torch.bool, device=ht.device)
+    return adj & ~eye
+
+
+class EntityPairGATLayer(nn.Module):
+    """Multi-head graph attention over the entity-PAIR graph from
+    _build_pair_adjacency (nodes = (h,t) pairs, not entities/sentences --
+    unrelated to EdgeFeaturedGATLayer above despite the similar shape).
+    Dot-product attention masked to graph neighbors (+self), plus a
+    learnable additive bias per (edge type, head) so a head can specialize
+    (e.g. one head upweighting bridge-succ for chain composition)."""
+
+    def __init__(self, dim: int, heads: int = 4, dropout: float = 0.1):
+        super().__init__()
+        assert dim % heads == 0, "pair_graph_dim must be divisible by pair_graph_heads"
+        self.heads = heads
+        self.head_dim = dim // heads
+        self.qkv = nn.Linear(dim, 3 * dim)
+        self.out = nn.Linear(dim, dim)
+        self.type_bias = nn.Parameter(torch.zeros(PAIR_EDGE_TYPES, heads))
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
+        m = x.size(0)
+        q, k, v = self.qkv(x).chunk(3, dim=-1)
+        q = q.view(m, self.heads, self.head_dim).transpose(0, 1)
+        k = k.view(m, self.heads, self.head_dim).transpose(0, 1)
+        v = v.view(m, self.heads, self.head_dim).transpose(0, 1)
+
+        scores = q @ k.transpose(-2, -1) / self.head_dim ** 0.5
+        scores = scores + torch.einsum("kmn,kh->hmn", adj.to(x.dtype), self.type_bias)
+        allowed = adj.any(0) | torch.eye(m, dtype=torch.bool, device=x.device)
+        scores = scores.masked_fill(~allowed.unsqueeze(0), float("-inf"))
+
+        att = self.dropout(torch.softmax(scores, dim=-1))
+        out = (att @ v).transpose(0, 1).reshape(m, -1)
+        return self.norm(x + self.dropout(self.out(out)))
+
+
 class DocREGATModel(nn.Module):
     def __init__(self, config, encoder, num_labels: int = 97, num_heads: int = 4,
                  dropout: float = 0.1, evidence_weight: float = 0.2,
                  evidence_tau: float = 0.1, offset: int = 1, loss_fnt: nn.Module = None,
                  use_jk: bool = True, use_gated_fusion: bool = False,
                  use_bilinear_classifier: bool = False, use_abs_diff: bool = False,
-                 use_metapath_attention: bool = False):
+                 use_metapath_attention: bool = False, use_pair_graph: bool = False,
+                 pair_graph_layers: int = 2, pair_graph_dim: int = 256,
+                 pair_graph_heads: int = 4):
         super().__init__()
         self.config = config
         self.encoder = encoder
@@ -215,6 +298,27 @@ class DocREGATModel(nn.Module):
         # bilinear_classifier/abs_diff above, this has NOT been distant-screened yet
         # (new this session); treat as unvalidated until an A/B run confirms it.
         self.use_metapath_attention = use_metapath_attention
+        # Entity-Pair Graph: second graph stage over (h,t) pair-nodes, targeting
+        # A->B,B->C=>A->C composition directly (see module docstring / the two
+        # classes above). Off by default -- new this session, CPU smoke-tested
+        # only, not distant-screened yet. zero-init graph_out below means it
+        # can only help relative to the no-pair-graph model, never destabilize it.
+        self.use_pair_graph = use_pair_graph
+        if use_pair_graph:
+            self.pair_graph_in = nn.Linear(2 * hidden, pair_graph_dim)
+            # relation-conditioned message: lets a neighbor pair-node read "what
+            # relation do you currently look like", not just raw entity/context
+            # features -- needed for actual composition (father_of + father_of
+            # => grandfather_of), not just "these pairs are contextually related".
+            self.pair_logit_to_graph = nn.Linear(num_labels, pair_graph_dim)
+            self.pair_gnn = nn.ModuleList(
+                EntityPairGATLayer(pair_graph_dim, heads=pair_graph_heads, dropout=dropout)
+                for _ in range(pair_graph_layers)
+            )
+            # zero-init residual head: at init the model IS the no-pair-graph model.
+            self.pair_graph_out = nn.Linear(pair_graph_dim, num_labels)
+            nn.init.zeros_(self.pair_graph_out.weight)
+            nn.init.zeros_(self.pair_graph_out.bias)
         if use_bilinear_classifier:
             self.emb_size = hidden
             self.block_size = 64
@@ -409,6 +513,18 @@ class DocREGATModel(nn.Module):
                 parts.append(context)
                 pair = torch.cat(parts, dim=-1)  # (P, 4H or 5H)
                 logits = self.classifier(self.pair_proj(pair))
+
+            if self.use_pair_graph:
+                # second graph stage: nodes = this doc's (h,t) pairs, not entities.
+                # node feature = entity-level repr (g_h,g_t) + this pair's own
+                # provisional relation prediction -- so (a,c) can read what (a,b)
+                # and (b,c) currently look like, not just their context.
+                pg = torch.tanh(self.pair_graph_in(torch.cat([g_h, g_t], dim=-1)))
+                pg = pg + self.pair_logit_to_graph(logits)
+                pair_adj = _build_pair_adjacency(ht)
+                for layer in self.pair_gnn:
+                    pg = layer(pg, pair_adj)
+                logits = logits + self.pair_graph_out(pg)
             all_logits.append(logits)
 
             if labels is not None:
