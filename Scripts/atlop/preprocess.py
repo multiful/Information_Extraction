@@ -1,3 +1,21 @@
+"""ATLOP-style feature construction for DocRED.
+
+Consumes raw documents from the team's shared loader
+(`data.docred_dataset.DocREDataset`) — we do NOT re-implement data loading and
+we reuse the shared `data.docred_io.build_rel2id` mapping, per PRD.md's
+"모든 트랙이 DocREDataset을 그대로 입력으로" rule.
+
+The only ATLOP-specific step is inserting a `"*"` marker token immediately
+before and after every mention, then recording the subword index of each start
+marker. ATLOP represents an entity by log-sum-exp pooling over its mentions'
+start-marker hidden states, so these positions are what the model slices.
+Re-implemented from wzhouad/ATLOP (prepro.py, read_docred); the repo's license
+is unspecified so nothing is copied verbatim.
+
+Marker positions here are recorded BEFORE the encoder's special tokens are
+added; the model adds a `+offset` (1 for the leading [CLS]) when indexing.
+"""
+
 import sys
 from pathlib import Path
 from typing import Optional
@@ -39,6 +57,8 @@ def _encode_with_markers(doc: dict, tokenizer: PreTrainedTokenizerBase):
             entity_end.add((sid, end_w - 1))
 
     tokens: list[str] = []
+    # sent_map[sid][word_idx] -> index in `tokens`; also holds len(sent) as a
+    # sentinel so a mention ending on the last word maps cleanly.
     sent_map: list[dict[int, int]] = []
     sent_pos: list[tuple[int, int]] = []
     for sid, sent in enumerate(sents):
@@ -68,6 +88,9 @@ def _encode_with_markers(doc: dict, tokenizer: PreTrainedTokenizerBase):
         entity_pos.append(spans)
 
     input_ids = tokenizer.convert_tokens_to_ids(tokens)
+    # Wrap with the encoder's leading/trailing special tokens ([CLS]..[SEP] /
+    # <s>..</s>). The single leading token is why the model uses offset=1 when
+    # indexing marker positions recorded above.
     input_ids = [tokenizer.cls_token_id] + input_ids + [tokenizer.sep_token_id]
     return input_ids, entity_pos, sent_pos
 

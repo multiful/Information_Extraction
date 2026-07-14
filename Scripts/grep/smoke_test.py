@@ -1,3 +1,17 @@
+"""End-to-end correctness check for the GREP pipeline on CPU.
+
+Mirrors Scripts/atlop/smoke_test.py: a tiny RANDOM-init BERT (no pretrained
+download) on a handful of dev docs, proving every stage wires up correctly --
+extended preprocessing (sent_pos/evidence/doc_rel_labels) -> encoder ->
+Entity Pair Reasoning graph -> Evidence Extraction / Global Relation
+Prediction losses (forward+backward, both with and without the evidence
+loss) -> Inference Fusion (pseudo-document construction + fused decode) ->
+common prediction format -> shared scorer.
+
+Run:  python -m Scripts.grep.smoke_test
+Real F1 numbers come from train_grep.py with a real pretrained encoder on GPU.
+"""
+
 import sys
 from pathlib import Path
 
@@ -82,6 +96,7 @@ def main():
               f"{sum(grads)}/{len(grads)} params have grads")
         assert all(grads), "some params did not receive gradients"
 
+    # predict() -> common format -> scorer (random weights, not a real score)
     model_full = build_model()
     model_no_evi = build_model()
     from torch.utils.data import DataLoader
@@ -92,6 +107,7 @@ def main():
     metrics = evaluate(predictions, docs, docs)
     print(f"[scorer] F1={metrics['f1'] * 100:.2f} Ign_F1={metrics['ign_f1'] * 100:.2f}")
 
+    # Inference Fusion (Eq 22) -- exercises pseudo-document construction end-to-end.
     fused_preds, gamma_used, fused_metrics = inference_fusion(
         model_full, model_no_evi, docs, features, tokenizer, rel2id, id2rel,
         torch.device("cpu"), gamma=0.0, sweep=False, ign_docs=docs,

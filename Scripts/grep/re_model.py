@@ -1,3 +1,46 @@
+"""GREP relation-extraction model.
+
+Re-implemented from Zhang, Yan & Cheng, "Document-Level Relation Extraction
+with Global Relations and Entity Pair Reasoning" (GREP), ACL Findings 2025
+(https://aclanthology.org/2025.findings-acl.1002/, code:
+https://github.com/yanyi74/GREP). Builds on the team's ATLOP reimplementation
+(`Scripts.atlop`): GREP's document encoding (marker insertion, log-sum-exp
+entity pooling, Localized Context Pooling -- paper Eq 1-4) is *identical* to
+ATLOP's, so it's reused (`process_long_input`) rather than reimplemented from
+scratch; `get_entity_and_pair_context` below is `DocREModel.get_hrt` with one
+addition: it also returns the raw per-pair token-attention `q` (paper's
+q^(s,o), Eq 3), which ATLOP computes but discards -- GREP's Evidence
+Extraction module needs it.
+
+On top of that shared encoding, GREP adds three modules (paper Fig. 2):
+  1. EntityPairGraph        -- Eq 5-14: build a graph over (head,tail) pairs
+     (edge k->j when k's tail == j's head) and run a small GAT+GCN stack so
+     pairs can exchange information before the final classifier.
+  2. Evidence Extraction    -- Eq 15-16: sum q^(s,o) over each sentence's
+     tokens to get a per-sentence distribution u^(s,o), trained with a KL
+     loss against the gold evidence sentences (`Scripts.grep.losses`).
+  3. Global Relation Prediction -- Eq 17-19: a document-level multi-label
+     classifier on the [CLS] token, whose (sigmoid) output is added to every
+     pair's logits.
+
+Implementation choices the paper leaves unspecified (see also README.md):
+  - f^(s,o) (Eq 7) node-feature dim: ATLOP's grouped-bilinear trick produces
+    an `emb_size*block_size`-dim vector; this is projected down to
+    `node_dim` (default = encoder hidden size) before entering the graph.
+  - Eq 9 as literally written aggregates `W^l f_j^{l-1}` (the *target* node's
+    own features) inside the neighbor sum, which -- since attention weights
+    sum to 1 -- collapses to just `W^l f_j^{l-1}` regardless of neighbors,
+    making the attention a no-op. Implemented instead as standard GAT
+    (aggregate `W^l f_k^{l-1}`, the *neighbor's* features), which is almost
+    certainly what was intended.
+  - Graph attention (Eq 8) head count: unspecified; 4 heads, Q/K shared
+    across graph layers, W^l per layer.
+  - Evidence-sentence selection for the Inference Fusion pseudo-document
+    (Sec 4.6, used in `Scripts/grep/train_grep.py`): a sentence is kept if
+    its u^(s,o) score is at least that pair's own mean sentence score
+    (paper doesn't specify a threshold).
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -73,17 +116,19 @@ class GREPModel(nn.Module):
         self.beta = beta
         self.loss_fnt = ATLoss()
 
-
+        # Eq 5-7: initial pair embedding -> graph node feature.
         self.init_head_extractor = nn.Linear(2 * self.hidden_size, emb_size)
         self.init_tail_extractor = nn.Linear(2 * self.hidden_size, emb_size)
         self.node_proj = nn.Linear(emb_size * block_size, self.node_dim)
 
         self.graph = EntityPairGraph(self.node_dim, num_layers=graph_layers, num_heads=graph_heads)
 
+        # Eq 10-14: final pair embedding -> relation logits.
         self.final_head_extractor = nn.Linear(2 * self.hidden_size + self.node_dim, emb_size)
         self.final_tail_extractor = nn.Linear(2 * self.hidden_size + self.node_dim, emb_size)
         self.bilinear = nn.Linear(emb_size * block_size, num_labels)
 
+        # Eq 17: global relation prediction (96 real relations; TH/class-0 excluded).
         self.doc_classifier = nn.Linear(self.hidden_size, num_labels - 1)
 
     def encode(self, input_ids, attention_mask):
@@ -179,17 +224,21 @@ class GREPModel(nn.Module):
             hs, rs, ts, q = hss[i], rss[i], tss[i], qs[i]
             n_ent = len(entity_pos[i])
 
+            # Eq 5-7: initial pair embedding -> graph node feature.
             zs0 = torch.tanh(self.init_head_extractor(torch.cat([hs, rs], dim=1)))
             zt0 = torch.tanh(self.init_tail_extractor(torch.cat([ts, rs], dim=1)))
             f0 = self.node_proj(self._group_bilinear(zs0, zt0))
 
+            # Eq 8-9: entity pair graph reasoning.
             adj = build_pair_adjacency(hts[i], n_ent, f0.device)
             f_update = self.graph(f0, adj)
 
+            # Eq 10-14: final pair embedding -> relation logits p^(s,o).
             zs = torch.tanh(self.final_head_extractor(torch.cat([hs, f_update, rs], dim=1)))
             zt = torch.tanh(self.final_tail_extractor(torch.cat([ts, f_update, rs], dim=1)))
             pair_logits = self.bilinear(self._group_bilinear(zs, zt))
 
+            # Eq 17 + 19: global relation prediction, fused into pair logits.
             cls_hidden = sequence_output[i, 0]
             doc_prob_i = torch.sigmoid(self.doc_classifier(cls_hidden))   # (num_labels-1,)
             doc_prob_padded = F.pad(doc_prob_i, (1, 0))                    # TH slot -> 0
@@ -201,6 +250,10 @@ class GREPModel(nn.Module):
 
         logits = torch.cat(all_logits, dim=0)
         preds = self.loss_fnt.get_label(logits, num_labels=self.num_labels)
+        # `all_u` (per-doc, ragged) and raw `logits` (flat across docs, like
+        # `preds`) are exposed for Scripts/grep/train_grep.py's Inference
+        # Fusion phase (Sec 4.6), which needs continuous scores + evidence
+        # distributions, not just the thresholded prediction.
         output = (preds, all_u, logits)
 
         if labels is not None:

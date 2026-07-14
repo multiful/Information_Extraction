@@ -1,3 +1,30 @@
+"""Train / evaluate GREP on DocRED (built on top of PRD track 2's ATLOP).
+
+Re-implements Zhang, Yan & Cheng, "Document-Level Relation Extraction with
+Global Relations and Entity Pair Reasoning" (GREP), ACL Findings 2025. Trains
+on `train_annotated` only (matching the paper's DocRED setup -- no distant
+supervision), evaluates on `dev` via the team's shared scorer so the numbers
+are directly comparable to `results/comparison.md`'s ATLOP baseline
+(dev F1 61.71 / Ign F1 59.86).
+
+Two models are trained (Sec 4.6, Inference Fusion Phase):
+  - `model_full`    : alpha, beta > 0 (the full GREP loss, Eq 21)
+  - `model_no_evi`  : same architecture/hyperparams, beta's evidence term
+                      simply not added during training (`use_evidence_loss=False`)
+At inference, `model_full`'s predictions pick each document's most-attended
+sentences, a pseudo-document is built from them, `model_no_evi` re-infers on
+that pseudo-document, and the two sets of logits are fused (Eq 22).
+
+Run from the project root, e.g.
+
+    # CPU sanity check (see Scripts/grep/smoke_test.py for a from-scratch,
+    # no-download version)
+    python -m Scripts.grep.train_grep --limit_docs 8 --epochs 1
+
+    # full run (GPU/Colab recommended, same as Scripts/atlop/train_re.py)
+    python -m Scripts.grep.train_grep --epochs 30 --run_name grep --save_model
+"""
+
 import argparse
 import json
 import random
@@ -144,6 +171,9 @@ def run_stage(model, loader, args, device, epochs, stage, dev_loader, dev_docs,
     return metrics, preds
 
 
+# ---------------------------------------------------------------------------
+# Inference Fusion Phase (paper Sec 4.6, Eq 22)
+# ---------------------------------------------------------------------------
 
 def build_pseudo_doc(doc: dict, kept_sent_ids: set[int]) -> tuple[dict, dict[int, int]]:
     """Restrict a raw DocREDataset doc to `kept_sent_ids`, re-indexing
@@ -209,6 +239,9 @@ def align_pseudo_logits(entry, raw_doc, model_no_evi, tokenizer, rel2id, collate
     if not positive_idx:
         return logits_pseudo, fallback
 
+    # Evidence-sentence selection (paper doesn't specify a threshold): keep a
+    # sentence if its score is >= that pair's own mean sentence score, union
+    # over every predicted-positive pair in the doc.
     kept_sents: set[int] = set()
     for i in positive_idx:
         u_row = entry["u"][i]
