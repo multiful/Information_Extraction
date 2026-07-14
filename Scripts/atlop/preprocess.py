@@ -1,21 +1,3 @@
-"""ATLOP-style feature construction for DocRED.
-
-Consumes raw documents from the team's shared loader
-(`data.docred_dataset.DocREDataset`) — we do NOT re-implement data loading and
-we reuse the shared `data.docred_io.build_rel2id` mapping, per PRD.md's
-"모든 트랙이 DocREDataset을 그대로 입력으로" rule.
-
-The only ATLOP-specific step is inserting a `"*"` marker token immediately
-before and after every mention, then recording the subword index of each start
-marker. ATLOP represents an entity by log-sum-exp pooling over its mentions'
-start-marker hidden states, so these positions are what the model slices.
-Re-implemented from wzhouad/ATLOP (prepro.py, read_docred); the repo's license
-is unspecified so nothing is copied verbatim.
-
-Marker positions here are recorded BEFORE the encoder's special tokens are
-added; the model adds a `+offset` (1 for the leading [CLS]) when indexing.
-"""
-
 import sys
 from pathlib import Path
 from typing import Optional
@@ -37,11 +19,12 @@ def _encode_with_markers(doc: dict, tokenizer: PreTrainedTokenizerBase):
 
     Returns (input_ids, entity_pos, sent_pos) where entity_pos[e] is a list of
     (start, end) subword spans (start = the `*` start-marker index), one per
-    mention, in vertexSet order, and sent_pos[s] is the (start, end) subword
-    span of sentence s (same marker-token coordinate system, used to aggregate
-    the localized-context attention into per-sentence mass for the DREEAM
-    evidence-guided attention loss). Positions exclude the [CLS]/[SEP] added at
-    the end (the model compensates with +offset).
+    mention, in vertexSet order, and sent_pos[sid] is the (start, end) subword
+    span of sentence `sid` (marker tokens included, same coordinate system as
+    entity_pos; used to aggregate token-level attention into per-sentence mass
+    for both the DREEAM evidence-guided attention loss and GREP's evidence
+    module). Positions exclude the [CLS]/[SEP] added at the end (the model
+    compensates with +offset).
     """
     sents = doc["sents"]
     vertex_set = doc["vertexSet"]
@@ -56,11 +39,11 @@ def _encode_with_markers(doc: dict, tokenizer: PreTrainedTokenizerBase):
             entity_end.add((sid, end_w - 1))
 
     tokens: list[str] = []
-    # sent_map[sid][word_idx] -> index in `tokens`; also holds len(sent) as a
-    # sentinel so a mention ending on the last word maps cleanly.
     sent_map: list[dict[int, int]] = []
+    sent_pos: list[tuple[int, int]] = []
     for sid, sent in enumerate(sents):
         smap: dict[int, int] = {}
+        sent_start = len(tokens)
         for wi, word in enumerate(sent):
             wp = tokenizer.tokenize(word)
             if (sid, wi) in entity_start:
@@ -71,6 +54,7 @@ def _encode_with_markers(doc: dict, tokenizer: PreTrainedTokenizerBase):
             tokens.extend(wp)
         smap[len(sent)] = len(tokens)
         sent_map.append(smap)
+        sent_pos.append((sent_start, len(tokens)))
 
     entity_pos: list[list[tuple[int, int]]] = []
     for entity in vertex_set:
@@ -83,15 +67,7 @@ def _encode_with_markers(doc: dict, tokenizer: PreTrainedTokenizerBase):
             spans.append((start, end))
         entity_pos.append(spans)
 
-    sent_pos: list[tuple[int, int]] = [
-        (sent_map[sid][0], sent_map[sid][len(sent)])
-        for sid, sent in enumerate(sents)
-    ]
-
     input_ids = tokenizer.convert_tokens_to_ids(tokens)
-    # Wrap with the encoder's leading/trailing special tokens ([CLS]..[SEP] /
-    # <s>..</s>). The single leading token is why the model uses offset=1 when
-    # indexing marker positions recorded above.
     input_ids = [tokenizer.cls_token_id] + input_ids + [tokenizer.sep_token_id]
     return input_ids, entity_pos, sent_pos
 
@@ -119,11 +95,17 @@ def build_features(
                                               ids (union across relations on
                                               that pair; [] if none — always []
                                               on train_distant, which carries no
-                                              evidence). Used only for the
-                                              DREEAM evidence-guided attention
-                                              loss, ignored otherwise.
+                                              evidence). Used by the DREEAM
+                                              evidence-guided attention loss and
+                                              GREP's evidence module; ignored by
+                                              plain ATLOP.
       title       : str
       num_entities: int
+      doc_rel_labels: list[int]               sorted positive relation ids
+                                              present anywhere in the doc; used
+                                              by GREP's Global Relation
+                                              Prediction module, ignored
+                                              otherwise
     """
     if rel2id is None:
         rel2id = build_rel2id()
@@ -155,6 +137,8 @@ def build_features(
                 labels.append(pos)
                 evidence.append(sorted(pair_evidence.get((h, t), ())))
 
+        doc_rel_labels = sorted({r for ids in triples.values() for r in ids})
+
         features.append(
             {
                 "input_ids": input_ids,
@@ -165,6 +149,7 @@ def build_features(
                 "evidence": evidence,
                 "title": doc["title"],
                 "num_entities": n_ent,
+                "doc_rel_labels": doc_rel_labels,
             }
         )
     return features
