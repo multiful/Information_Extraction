@@ -1,13 +1,8 @@
 # 모델 비교 기록 (PRD §6)
 
-> **최종 업데이트**: 2026-07-14: **트랙1 (RoBERTa + LCP + AT + PU, `final_full_pu`) 폐기 결정** —
-> baseline 대비 +0.06/+0.12가 seed 변동폭(±1점) 이내라 유의미한 우위로 볼 수 없음. 이후 방향은
-> Baseline(`Scripts/atlop`) 위에 GAT를 얹는 트랙(`Scripts/dk_gat`)에 집중.
+> **최종 업데이트**: 2026-07-13: 개선 모델 2종 비교 섹션 추가 — 개선 1(GCN)·개선 2(GAT), Entity Pair Graph로 multi-hop 약점(테스트 1) 공략. 학습 명령·판정 기준 기록, 결과 수치는 Colab 학습 후 기입 예정.
 >
-> 2026-07-13: 트랙3 `atlop_full_pu07`(ATLOP + PUATLoss na_weight=0.7, Colab A100)
-> **dev F1 62.06 / Ign F1 60.16** 추가 — 현재 비교표 1위 (단 baseline 대비 +0.35는 seed 변동폭 이내).
-> 이전: ATLOP baseline 61.71/59.86 기록(논문 대비 +0.62/+0.64, 재현 성공), 누수 검사(문서 중복 0건),
-> 트랙1 `final_full_pu`(61.77/59.98) 비교 행, 약점 probe(상호참조 통과, 장거리·교란 실패).
+> 2026-07-13: 트랙3 `atlop_full_pu07`(ATLOP + PUATLoss na_weight=0.7, Colab A100) **dev F1 62.06 / Ign F1 60.16** 추가 — 현재 비교표 1위 (단 baseline 대비 +0.35는 seed 변동폭 이내). ATLOP baseline 61.71/59.86 기록(논문 대비 +0.62/+0.64, 재현 성공), 누수 검사(문서 중복 0건), 트랙1 `final_full_pu`(61.77/59.98) 비교 행, 약점 probe(상호참조 통과, 장거리·교란 실패).
 
 ## ATLOP baseline (트랙 2)
 
@@ -34,14 +29,32 @@
 | RoBERTa + LCP + AT (+PU distant, 트랙1 `final_full_pu`) | 61.77 | 59.98 | 예정 | 예정 |
 | **ATLOP + PUATLoss na_weight=0.7 (트랙3, `atlop_full_pu07`)** | **62.06** | **60.16** | 예정 | 예정 |
 
-트랙1 `final_full_pu` vs baseline: F1 +0.06 / Ign +0.12 — 시드 변동(±1점) 안이라 사실상 동률. 구조 차이: mention 평균 풀링(단순화, ablation −1.3점 감수) + RoBERTa + PU Loss + distant 전체 10만으로 만회한 구성.
-
-**트랙1 폐기 (2026-07-14)**: 위 격차가 유의미한 우위가 아니라고 판단해 RoBERTa+PU 방향은 더 이상
-진행하지 않음. probe 1·2 정성 비교도 진행 안 함. 이후 트랙은 `Scripts/dk_gat`(Baseline 위에
-Edge-featured GAT 추가, 아키텍처 변수만 통제 비교)로 전환.
+트랙1 `final_full_pu` vs baseline: F1 +0.06 / Ign +0.12 — 시드 변동(±1점) 안이라 사실상 동률. 구조 차이: mention 평균 풀링(단순화, ablation −1.3점 감수) + RoBERTa + PU Loss + distant 전체 10만으로 만회한 구성. probe 1·2 정성 비교 예정.
 
 트랙3 `atlop_full_pu07` (2026-07-13, Colab A100, seed 66): baseline과 완전 동일 레시피에서 distant
 프리트레인 손실만 PUATLoss(na_weight=0.7)로 교체 — F1 +0.35 / Ign +0.30, recall +1.29 (P −0.85).
 stage-1(distant 직후) 시점 이득은 훨씬 크고(+2.93 F1, 5천개 A/B 기준) 파인튜닝을 거치며 줄지만 방향
 유지. 문제정의·메커니즘·구출 통계(정답 1,415개 임계값 위로 복귀)는 `Scripts/atlop/PU_THRESHOLD_EXPERIMENT.md`
 참고. 역시 single seed라 ±1점 유의성 주의 — 확정 비교는 2 seed 평균 필요.
+
+## 개선 모델 (트랙 2 후속) — Entity Pair Graph로 multi-hop 약점 공략
+
+`model.ipynb` 테스트 1(허구 지명 multi-hop: A→B, B→C 명시 시 A→C 조합 추론)에서 baseline이 실패 — (0,1)·(1,2) 명시 관계와 (0,2) 조합 관계 모두 미검출. 이를 겨냥해 baseline 파일 무수정(상속)으로 개선 모델 2종 추가 (`Scripts/atlop/README.md`의 "개선 모델 2종" 참고):
+
+- **개선 1** `re_model_gcn.py` — GREP: Entity Pair Graph + relational GCN (이웃 고정 평균 집계)
+- **개선 2** `re_model_gat.py` — Localized Context Pooling + Entity Pair Graph + GAT (attention 집계, bridge 엣지 특화 가능)
+- 노드 특징·그래프 동일, 집계 방식만 달라 GCN vs GAT ablation이 됨. zero-init 잔차 헤드라 warm-start 시 시작점 = baseline (smoke_test_graph.py로 parity 검증 완료).
+
+학습 (Colab A100, baseline과 동일 레시피):
+```bash
+python -m Scripts.atlop.train_graph --model gcn --epochs 15 --distant_limit 20000 --distant_epochs 1 --eval_batch_size 32 --save_model
+python -m Scripts.atlop.train_graph --model gat --epochs 15 --distant_limit 20000 --distant_epochs 1 --eval_batch_size 32 --save_model
+```
+
+| 모델 | dev F1 | Ign F1 | 테스트 1 (0,1)·(1,2) 명시 | 테스트 1 (0,2) 조합 |
+|---|---|---|---|---|
+| ATLOP baseline | 61.71 | 59.86 | 실패 | 실패 |
+| 개선 1 — GCN (`atlop_gcn.pt`) | (학습 후 기입) | | | |
+| 개선 2 — GAT (`atlop_gat.pt`) | (학습 후 기입) | | | |
+
+판정 기준: dev F1/Ign F1은 시드 변동 ±1점을 감안해 해석. 정성 판정은 `model.ipynb` "개선 모델 검증" 셀 실행 결과로 기입.
