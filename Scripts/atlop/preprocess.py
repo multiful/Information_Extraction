@@ -34,10 +34,13 @@ MARKER = "*"
 def _encode_with_markers(doc: dict, tokenizer: PreTrainedTokenizerBase):
     """Tokenize a document word-by-word, wrapping each mention in `*` markers.
 
-    Returns (input_ids, entity_pos) where entity_pos[e] is a list of
+    Returns (input_ids, entity_pos, sent_pos) where entity_pos[e] is a list of
     (start, end) subword spans (start = the `*` start-marker index), one per
-    mention, in vertexSet order. Positions exclude the [CLS]/[SEP] added at the
-    end (the model compensates with +offset).
+    mention, in vertexSet order, and sent_pos[s] is the (start, end) subword
+    span of sentence s (same marker-token coordinate system, used to aggregate
+    the localized-context attention into per-sentence mass for the DREEAM
+    evidence-guided attention loss). Positions exclude the [CLS]/[SEP] added at
+    the end (the model compensates with +offset).
     """
     sents = doc["sents"]
     vertex_set = doc["vertexSet"]
@@ -79,12 +82,17 @@ def _encode_with_markers(doc: dict, tokenizer: PreTrainedTokenizerBase):
             spans.append((start, end))
         entity_pos.append(spans)
 
+    sent_pos: list[tuple[int, int]] = [
+        (sent_map[sid][0], sent_map[sid][len(sent)])
+        for sid, sent in enumerate(sents)
+    ]
+
     input_ids = tokenizer.convert_tokens_to_ids(tokens)
     # Wrap with the encoder's leading/trailing special tokens ([CLS]..[SEP] /
     # <s>..</s>). The single leading token is why the model uses offset=1 when
     # indexing marker positions recorded above.
     input_ids = [tokenizer.cls_token_id] + input_ids + [tokenizer.sep_token_id]
-    return input_ids, entity_pos
+    return input_ids, entity_pos, sent_pos
 
 
 def build_features(
@@ -98,6 +106,7 @@ def build_features(
     Each feature:
       input_ids   : list[int]  (with [CLS]/[SEP], `*` markers inserted)
       entity_pos  : list[list[(start, end)]]  marker-based spans per mention
+      sent_pos    : list[(start, end)]        marker-based span per sentence
       hts         : list[(h, t)]              every ordered entity pair, h != t
       labels      : list[list[int]]           per pair, the positive class ids
                                               (Na pairs -> [0]); the collate_fn
@@ -105,6 +114,13 @@ def build_features(
                                               multi-hot tensor. Stored sparsely
                                               so train_distant (100k docs) fits
                                               in memory.
+      evidence    : list[list[int]]           per pair, gold evidence sentence
+                                              ids (union across relations on
+                                              that pair; [] if none — always []
+                                              on train_distant, which carries no
+                                              evidence). Used only for the
+                                              DREEAM evidence-guided attention
+                                              loss, ignored otherwise.
       title       : str
       num_entities: int
     """
@@ -114,16 +130,18 @@ def build_features(
     features: list[dict] = []
     it = tqdm(docs, desc="preprocess") if show_progress else docs
     for doc in it:
-        input_ids, entity_pos = _encode_with_markers(doc, tokenizer)
+        input_ids, entity_pos, sent_pos = _encode_with_markers(doc, tokenizer)
         n_ent = len(doc["vertexSet"])
 
-        # gold relations keyed by (head_idx, tail_idx)
+        # gold relations + evidence sentences keyed by (head_idx, tail_idx)
         triples: dict[tuple[int, int], list[int]] = {}
+        pair_evidence: dict[tuple[int, int], set[int]] = {}
         for label in doc.get("labels", []):
             key = (label["h"], label["t"])
             triples.setdefault(key, []).append(rel2id[label["r"]])
+            pair_evidence.setdefault(key, set()).update(label.get("evidence", []))
 
-        hts, labels = [], []
+        hts, labels, evidence = [], [], []
         for h in range(n_ent):
             for t in range(n_ent):
                 if h == t:
@@ -134,13 +152,16 @@ def build_features(
                     pos = [0]  # Na / TH
                 hts.append((h, t))
                 labels.append(pos)
+                evidence.append(sorted(pair_evidence.get((h, t), ())))
 
         features.append(
             {
                 "input_ids": input_ids,
                 "entity_pos": entity_pos,
+                "sent_pos": sent_pos,
                 "hts": hts,
                 "labels": labels,
+                "evidence": evidence,
                 "title": doc["title"],
                 "num_entities": n_ent,
             }

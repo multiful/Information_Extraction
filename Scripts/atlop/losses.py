@@ -67,3 +67,39 @@ class ATLoss(nn.Module):
         # Rows with no relation above threshold -> predict Na (class 0).
         output[:, 0] = (output.sum(1) == 0).to(logits)
         return output
+
+
+def evidence_loss(sent_attns: list[torch.Tensor], evidence: list[list[list[int]]]) -> torch.Tensor:
+    """DREEAM-style evidence-guided attention loss.
+
+    Re-implemented from the evidence-supervision idea in Ma et al., "DREEAM:
+    Guiding Attention with Evidence for Improving Document-Level Relation
+    Extraction" (ACL 2023): supervise the localized-context attention itself
+    (not just the final relation logits) so it concentrates on the gold
+    evidence sentences, rather than only on whichever tokens already scored
+    highest.
+
+    sent_attns[i]: (n_pair, n_sent) attention mass per sentence, for doc i's
+        pairs in hts order (from DocREModel.get_hrt).
+    evidence[i][k]: gold evidence sentence ids for pair k of doc i; empty for
+        pairs with no evidence supervision (Na pairs, or splits without gold
+        evidence like train_distant), which are skipped entirely.
+
+    For each supervised pair, the target is a uniform distribution over its
+    gold evidence sentences; the loss is the cross-entropy between that target
+    and the model's per-sentence attention mass. Averaged over every
+    supervised pair in the batch; 0.0 (no gradient) if none exist.
+    """
+    losses = []
+    for attn, doc_evidence in zip(sent_attns, evidence):
+        if attn.size(1) == 0:
+            continue
+        for k, evi in enumerate(doc_evidence):
+            if not evi:
+                continue
+            target = attn.new_zeros(attn.size(1))
+            target[evi] = 1.0 / len(evi)
+            losses.append(-(target * torch.log(attn[k] + 1e-30)).sum())
+    if not losses:
+        return sent_attns[0].sum() * 0.0 if sent_attns else torch.tensor(0.0)
+    return torch.stack(losses).mean()
