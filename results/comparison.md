@@ -1,6 +1,10 @@
 # 모델 비교 기록 (PRD §6)
 
-> **최종 업데이트**: 2026-07-13: 트랙3 `atlop_full_pu07`(ATLOP + PUATLoss na_weight=0.7, Colab A100)
+> **최종 업데이트**: 2026-07-14: **트랙1 (RoBERTa + LCP + AT + PU, `final_full_pu`) 폐기 결정** —
+> baseline 대비 +0.06/+0.12가 seed 변동폭(±1점) 이내라 유의미한 우위로 볼 수 없음. 이후 방향은
+> Baseline(`Scripts/atlop`) 위에 GAT를 얹는 트랙(`Scripts/dk_gat`)에 집중.
+>
+> 2026-07-13: 트랙3 `atlop_full_pu07`(ATLOP + PUATLoss na_weight=0.7, Colab A100)
 > **dev F1 62.06 / Ign F1 60.16** 추가 — 현재 비교표 1위 (단 baseline 대비 +0.35는 seed 변동폭 이내).
 > 이전: ATLOP baseline 61.71/59.86 기록(논문 대비 +0.62/+0.64, 재현 성공), 누수 검사(문서 중복 0건),
 > 트랙1 `final_full_pu`(61.77/59.98) 비교 행, 약점 probe(상호참조 통과, 장거리·교란 실패).
@@ -30,7 +34,11 @@
 | RoBERTa + LCP + AT (+PU distant, 트랙1 `final_full_pu`) | 61.77 | 59.98 | 예정 | 예정 |
 | **ATLOP + PUATLoss na_weight=0.7 (트랙3, `atlop_full_pu07`)** | **62.06** | **60.16** | 예정 | 예정 |
 
-트랙1 `final_full_pu` vs baseline: F1 +0.06 / Ign +0.12 — 시드 변동(±1점) 안이라 사실상 동률. 구조 차이: mention 평균 풀링(단순화, ablation −1.3점 감수) + RoBERTa + PU Loss + distant 전체 10만으로 만회한 구성. probe 1·2 정성 비교 예정.
+트랙1 `final_full_pu` vs baseline: F1 +0.06 / Ign +0.12 — 시드 변동(±1점) 안이라 사실상 동률. 구조 차이: mention 평균 풀링(단순화, ablation −1.3점 감수) + RoBERTa + PU Loss + distant 전체 10만으로 만회한 구성.
+
+**트랙1 폐기 (2026-07-14)**: 위 격차가 유의미한 우위가 아니라고 판단해 RoBERTa+PU 방향은 더 이상
+진행하지 않음. probe 1·2 정성 비교도 진행 안 함. 이후 트랙은 `Scripts/dk_gat`(Baseline 위에
+Edge-featured GAT 추가, 아키텍처 변수만 통제 비교)로 전환.
 
 트랙3 `atlop_full_pu07` (2026-07-13, Colab A100, seed 66): baseline과 완전 동일 레시피에서 distant
 프리트레인 손실만 PUATLoss(na_weight=0.7)로 교체 — F1 +0.35 / Ign +0.30, recall +1.29 (P −0.85).
