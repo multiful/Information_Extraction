@@ -103,20 +103,64 @@ def predict(model, loader, id2rel, device):
     return out
 
 
+def build_param_groups(model, lr, weight_decay, layerwise_lr_decay):
+    """Flat LR (layerwise_lr_decay=1.0, default -- current behavior, single
+    param group) or BERT layer-wise decay: each encoder layer's LR is
+    lr * decay^(depth from the top layer), embeddings get one extra decay
+    step, and everything outside model.encoder (GAT/classifier/edge-embeddings
+    -- the task-specific head) always trains at the full lr regardless of
+    decay. Pooler (unused in forward()) is simply never assigned a group, so
+    it never trains -- harmless since it has no gradient anyway."""
+    if layerwise_lr_decay >= 1.0:
+        return [{"params": list(model.parameters()), "lr": lr, "weight_decay": weight_decay}]
+    bert = model.encoder
+    layers = list(bert.encoder.layer)
+    num_layers = len(layers)
+    groups = [{"params": list(bert.embeddings.parameters()),
+               "lr": lr * (layerwise_lr_decay ** (num_layers + 1)),
+               "weight_decay": weight_decay}]
+    for depth, layer in enumerate(layers):
+        groups.append({"params": list(layer.parameters()),
+                        "lr": lr * (layerwise_lr_decay ** (num_layers - depth)),
+                        "weight_decay": weight_decay})
+    encoder_param_ids = {id(p) for p in bert.parameters()}
+    head_params = [p for p in model.parameters() if id(p) not in encoder_param_ids]
+    groups.append({"params": head_params, "lr": lr, "weight_decay": weight_decay})
+    return groups
+
+
 def run_stage(model, loader, args, device, epochs, stage, dev_loader, dev_docs, ign_docs, id2rel,
-             best_ckpt_path=None):
+             best_ckpt_path=None, lr=None, freeze_encoder_epochs=0, evidence_start_epoch=0,
+             early_stop_patience=0):
     """best_ckpt_path: if given, save model.state_dict() there every time a new
     best dev F1 is seen (separate from the caller's own final-epoch save) --
     epoch-to-epoch dev F1 isn't monotonic (we've observed real dips, e.g.
     epoch 6 59.85 -> epoch 7 59.57 on a real run), so whichever epoch happens
-    to be last isn't guaranteed to be the best one actually reached."""
+    to be last isn't guaranteed to be the best one actually reached.
+
+    lr: overrides args.lr for this stage (used for --lr2, stage 2 only);
+    defaults to args.lr when not given. freeze_encoder_epochs/
+    evidence_start_epoch/early_stop_patience: see their --help text in
+    build_argparser -- all default to 0/disabled, i.e. current behavior."""
+    lr = args.lr if lr is None else lr
     total_steps = max(1, len(loader) * epochs)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    param_groups = build_param_groups(model, lr, args.weight_decay, args.layerwise_lr_decay)
+    optimizer = torch.optim.AdamW(param_groups, lr=lr, weight_decay=args.weight_decay)
     scheduler = get_linear_schedule_with_warmup(
         optimizer, int(total_steps * args.warmup_ratio), total_steps)
     metrics, preds = None, None
-    best_f1, best_epoch = -1.0, -1
+    best_f1, best_epoch, no_improve = -1.0, -1, 0
+    base_evidence_weight = model.evidence_weight
     for epoch in range(epochs):
+        if freeze_encoder_epochs > 0:
+            should_freeze = epoch < freeze_encoder_epochs
+            for p in model.encoder.parameters():
+                p.requires_grad = not should_freeze
+            if epoch == 0 or epoch == freeze_encoder_epochs:
+                print(f"  [{stage}] encoder {'frozen' if should_freeze else 'unfrozen'} "
+                      f"(epoch {epoch})", flush=True)
+        if evidence_start_epoch > 0:
+            model.evidence_weight = base_evidence_weight if epoch >= evidence_start_epoch else 0.0
         model.train()
         running = 0.0
         for step, batch in enumerate(loader):
@@ -139,9 +183,21 @@ def run_stage(model, loader, args, device, epochs, stage, dev_loader, dev_docs, 
               f"(P={metrics['precision'] * 100:.2f} R={metrics['recall'] * 100:.2f})"
               f"{'  <- new best' if is_best else ''}", flush=True)
         if is_best:
-            best_f1, best_epoch = metrics["f1"], epoch
+            best_f1, best_epoch, no_improve = metrics["f1"], epoch, 0
             if best_ckpt_path is not None:
                 torch.save(model.state_dict(), best_ckpt_path)
+        else:
+            no_improve += 1
+            if early_stop_patience > 0 and no_improve >= early_stop_patience:
+                print(f"[{stage}] early stopping at epoch {epoch} "
+                      f"(no dev F1 improvement for {no_improve} epochs, best={best_f1 * 100:.2f} "
+                      f"@ epoch {best_epoch})", flush=True)
+                break
+    if freeze_encoder_epochs > 0:
+        for p in model.encoder.parameters():
+            p.requires_grad = True
+    if evidence_start_epoch > 0:
+        model.evidence_weight = base_evidence_weight
     if best_ckpt_path is not None:
         print(f"[{stage}] best epoch = {best_epoch} (dev_F1={best_f1 * 100:.2f}), "
               f"saved to {best_ckpt_path}", flush=True)
@@ -178,8 +234,13 @@ def train(args):
     config.sep_token_id = tokenizer.sep_token_id
     model = DocREGATModel(config, encoder, num_labels=NUM_CLASSES,
                           num_heads=args.gat_heads, dropout=args.dropout,
-                          evidence_weight=args.evidence_weight).to(device)
+                          evidence_weight=args.evidence_weight,
+                          use_jk=not args.no_jk,
+                          use_gated_fusion=args.use_gated_fusion,
+                          use_bilinear_classifier=args.use_bilinear_classifier,
+                          use_abs_diff=args.use_abs_diff).to(device)
 
+    stage1_metrics, stage1_preds = None, None
     if args.distant_epochs > 0:
         distant_docs = list(DocREDataset("train_distant"))
         cap = args.limit_docs if args.limit_docs > 0 else args.distant_limit
@@ -195,9 +256,12 @@ def train(args):
                                     collate_fn=collate)
         RESULTS_DIR.mkdir(exist_ok=True)
         stage1_best = RESULTS_DIR / f"{args.run_name}_stage1_best.pt" if args.save_model else None
-        run_stage(model, distant_loader, args, device, args.distant_epochs,
-                  "distant-pretrain", dev_loader, dev_docs, train_docs, id2rel,
-                  best_ckpt_path=stage1_best)
+        stage1_metrics, stage1_preds = run_stage(
+            model, distant_loader, args, device, args.distant_epochs,
+            "distant-pretrain", dev_loader, dev_docs, train_docs, id2rel,
+            best_ckpt_path=stage1_best, freeze_encoder_epochs=args.freeze_encoder_epochs,
+            evidence_start_epoch=args.evidence_start_epoch,
+            early_stop_patience=args.early_stop_patience)
         del distant_loader, distant_docs
         if args.save_model:
             p = RESULTS_DIR / f"{args.run_name}_stage1.pt"
@@ -208,14 +272,32 @@ def train(args):
         # plain ATLoss for stage 2, matching Scripts/atlop/train_re.py.
         model.loss_fnt = ATLoss()
 
-    print(f"[stage 2] annotated fine-tune on {len(train_docs)} docs ({args.epochs} epoch(s))",
-          flush=True)
-    RESULTS_DIR.mkdir(exist_ok=True)
-    best_ckpt = RESULTS_DIR / f"{args.run_name}_best.pt" if args.save_model else None
-    metrics, preds = run_stage(model, train_loader, args, device, args.epochs,
-                               "annotated-finetune", dev_loader, dev_docs, train_docs, id2rel,
-                               best_ckpt_path=best_ckpt)
+    if args.epochs > 0:
+        print(f"[stage 2] annotated fine-tune on {len(train_docs)} docs ({args.epochs} epoch(s))",
+              flush=True)
+        RESULTS_DIR.mkdir(exist_ok=True)
+        best_ckpt = RESULTS_DIR / f"{args.run_name}_best.pt" if args.save_model else None
+        metrics, preds = run_stage(model, train_loader, args, device, args.epochs,
+                                   "annotated-finetune", dev_loader, dev_docs, train_docs, id2rel,
+                                   best_ckpt_path=best_ckpt, lr=args.lr2,
+                                   freeze_encoder_epochs=args.freeze_encoder_epochs,
+                                   evidence_start_epoch=args.evidence_start_epoch,
+                                   early_stop_patience=args.early_stop_patience)
+    else:
+        # --epochs 0: quick distant-only screening run (e.g. na_weight/gat_heads
+        # sweeps) -- matches Scripts/atlop/train_re.py's same convention. Falls
+        # back to stage 1's metrics/predictions instead of leaving them None
+        # (which used to crash json.dump/len below).
+        print("[stage 2] skipped (--epochs 0) -- reporting stage-1 metrics/predictions",
+              flush=True)
+        metrics, preds = stage1_metrics, stage1_preds
+        best_ckpt = None
 
+    if preds is None:
+        # both --distant_epochs 0 and --epochs 0 -- nothing was actually trained/evaluated.
+        print("[warning] no stage ran (--distant_epochs 0 and --epochs 0) -- nothing to save",
+              flush=True)
+        return metrics
     RESULTS_DIR.mkdir(exist_ok=True)
     pred_path = RESULTS_DIR / f"{args.run_name}_dev_predictions.json"
     with open(pred_path, "w", encoding="utf-8") as fp:
@@ -258,7 +340,52 @@ def build_argparser():
     p.add_argument("--max_grad_norm", type=float, default=1.0)
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--gat_heads", type=int, default=4)
+    p.add_argument("--no_jk", action="store_true",
+                   help="disable Jump Knowledge (max over input/layer1/layer2) and fall back "
+                        "to last-GAT-layer-only output -- for A/B testing JK itself before "
+                        "trusting it as the default")
+    p.add_argument("--use_gated_fusion", action="store_true",
+                   help="learned per-dim gate blending GAT-refined entity embedding with the "
+                        "original pre-GAT one, instead of JK's max (supersedes --no_jk when "
+                        "set). Off by default -- A/B test before trusting as the default")
+    p.add_argument("--use_bilinear_classifier", action="store_true",
+                   help="ATLOP-style grouped bilinear classifier (head/tail extractors + "
+                        "block-wise outer product) instead of concat+g_h*g_t+MLP -- replaces "
+                        "the interaction term entirely, doesn't stack with it. Off by default "
+                        "-- A/B test before trusting as the default")
+    p.add_argument("--use_abs_diff", action="store_true",
+                   help="append |g_h - g_t| to the pair representation (InferSent-style), "
+                        "alongside the existing g_h*g_t term. Ignored when "
+                        "--use_bilinear_classifier is set. Off by default -- A/B test first")
     p.add_argument("--evidence_weight", type=float, default=0.2)
+    p.add_argument("--evidence_start_epoch", type=int, default=0,
+                   help="curriculum: evidence contrastive loss is added only from this "
+                        "within-stage epoch onward (0 = active from the start, current "
+                        "behavior). Motivation: early epochs the LCP context is still noisy, "
+                        "so pulling it toward evidence sentences may fight the main ATLoss "
+                        "signal before the model has learned basic entity/relation cues")
+    p.add_argument("--freeze_encoder_epochs", type=int, default=0,
+                   help="freeze the BERT encoder's parameters for this many epochs at the "
+                        "start of each stage (0 = never freeze, current behavior) -- lets the "
+                        "GAT/classifier head warm up on a stable pretrained representation "
+                        "before the encoder itself starts moving")
+    p.add_argument("--lr2", type=float, default=None,
+                   help="separate learning rate for stage 2 (annotated fine-tune); defaults "
+                        "to --lr (current behavior, unset) if not given. Fine-tune stages "
+                        "often want a lower LR than pretrain -- keep this as an explicit A/B "
+                        "knob instead of silently changing --lr's default, since --lr is also "
+                        "what stage 1 uses and changing it would break the controlled "
+                        "architecture-only comparison against Scripts/atlop baseline")
+    p.add_argument("--layerwise_lr_decay", type=float, default=1.0,
+                   help="BERT layer-wise LR decay factor (1.0 = disabled/uniform LR, current "
+                        "behavior). Each encoder layer's LR is base_lr * decay^(depth from "
+                        "top); embeddings get one extra decay step. Typical values 0.8-0.95 "
+                        "-- lower layers move less, reducing catastrophic forgetting of "
+                        "pretrained representations during fine-tune")
+    p.add_argument("--early_stop_patience", type=int, default=0,
+                   help="stop a stage early if dev F1 doesn't improve for this many "
+                        "consecutive epochs (0 = disabled, current behavior -- always runs "
+                        "the full epoch count)")
     p.add_argument("--use_pu_loss", action="store_true",
                    help="PUATLoss for the distant stage instead of plain ATLoss "
                         "(na_weight=0.7 default was swept and validated on Scripts/atlop -- "
