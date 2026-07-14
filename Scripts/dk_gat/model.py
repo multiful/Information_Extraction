@@ -86,6 +86,19 @@ zero-init residual on top, so at initialization the model is exactly the
 no-pair-graph model -- it can only help, never destabilize the existing,
 already-validated pipeline, and any regression is attributable to the graph
 actually hurting rather than to changed initialization.
+
+Evidence Fusion (evidence_fusion=True, forward() kwarg, off by default --
+inference-time only, no new parameters, see _evidence_fusion_context /
+_classify): EIDER-style (Xie et al., Findings ACL 2022) fusion of the normal
+full-document prediction with a second prediction made from an evidence-only
+LCP context, cheaply approximated by re-pooling the already-computed
+sequence_output/attention instead of a second BERT forward pass over a
+reconstructed document. Evidence sentences are predicted per-pair from the
+model's own context/sentence-embedding similarity (no gold evidence needed,
+so it works at test time too) -- a more direct reuse of that similarity than
+the InfoNCE evidence loss, which only contrasts it against gold labels
+during annotated training. Meant to be toggled on only in train_gat.py's
+predict() (see its docstring), never during the training forward pass.
 """
 
 import sys
@@ -409,6 +422,67 @@ class DocREGATModel(nn.Module):
         tj = types.unsqueeze(0).expand(n, n, 8)
         return torch.cat([cat, dist, ti, tj], dim=-1)  # (N, N, 32)
 
+    def _classify(self, g_h, g_t, context):
+        """Run the configured classifier head (bilinear or MLP+interaction) on
+        a given (g_h, g_t, context) triple -- factored out so evidence-fusion
+        inference (below) can call it a second time with an evidence-only
+        context without duplicating the branch."""
+        if self.use_bilinear_classifier:
+            hs = torch.tanh(self.head_extractor(torch.cat([g_h, context], dim=-1)))
+            ts = torch.tanh(self.tail_extractor(torch.cat([g_t, context], dim=-1)))
+            b1 = hs.view(-1, self.emb_size // self.block_size, self.block_size)
+            b2 = ts.view(-1, self.emb_size // self.block_size, self.block_size)
+            bl = (b1.unsqueeze(3) * b2.unsqueeze(2)).view(-1, self.emb_size * self.block_size)
+            return self.bilinear(bl)
+        parts = [g_h, g_t, g_h * g_t]
+        if self.use_abs_diff:
+            parts.append(torch.abs(g_h - g_t))
+        parts.append(context)
+        pair = torch.cat(parts, dim=-1)
+        return self.classifier(self.pair_proj(pair))
+
+    def _evidence_fusion_context(self, context, joint, seq_i, sent_emb, sent_spans_i, top_k):
+        """EIDER-style (Xie et al., Findings ACL 2022) inference-time evidence
+        fusion, cheap-approximation variant: instead of re-encoding a
+        reconstructed evidence-only document through BERT a second time (the
+        paper's approach), reuse the already-computed sequence_output/joint
+        attention from this forward pass and just re-pool LCP context
+        restricted to each pair's own predicted evidence sentences.
+
+        Evidence prediction needs no gold evidence labels (must work at
+        inference/test time, where none exist): score each sentence by cosine
+        similarity between its embedding and the pair's ORIGINAL full-document
+        LCP context, the same similarity function the InfoNCE evidence loss
+        already trains during annotated fine-tuning -- just reused
+        unsupervised here instead of contrasted against gold evidence.
+        Top-`top_k` sentences per pair are kept; the joint (head*tail)
+        attention distribution is renormalized over only those sentences'
+        token positions to give an evidence-focused LCP context, which the
+        caller reclassifies and fuses with the full-document prediction.
+        Pairs with no sentences (shouldn't happen, num_sents>0 guaranteed by
+        caller) fall back to the original context."""
+        sent_emb_n = F.normalize(sent_emb, dim=-1)              # (S, H)
+        context_n = F.normalize(context, dim=-1)                # (P, H)
+        sims = context_n @ sent_emb_n.t()                       # (P, S)
+        k = min(top_k, sent_emb.size(0))
+        top_idx = sims.topk(k, dim=1).indices                   # (P, k)
+
+        p, length = joint.shape
+        ev_mask = torch.zeros(p, length, dtype=torch.bool, device=joint.device)
+        for s_idx, (s, e) in enumerate(sent_spans_i):
+            s, e = s + self.offset, min(e + self.offset, length)
+            if e <= s:
+                continue
+            hits = (top_idx == s_idx).any(dim=1)                # (P,) pairs picking this sentence
+            if hits.any():
+                ev_mask[hits, s:e] = True
+
+        joint_ev = joint * ev_mask
+        denom = joint_ev.sum(1, keepdim=True)
+        valid = denom.squeeze(1) > 1e-12
+        context_ev = (joint_ev / denom.clamp(min=1e-30)) @ seq_i
+        return torch.where(valid.unsqueeze(1), context_ev, context)
+
     def _evidence_loss(self, context, hts_i, evidence_i, sent_embs, num_sents):
         """InfoNCE: pull each pair's LCP context toward its gold evidence
         sentences, against the document's other sentences. Skipped when the doc
@@ -437,13 +511,22 @@ class DocREGATModel(nn.Module):
             return None
         return torch.stack(losses).mean()
 
-    def forward(self, input_ids, attention_mask, batch_features, labels=None):
+    def forward(self, input_ids, attention_mask, batch_features, labels=None,
+                evidence_fusion: bool = False, evidence_fusion_top_k: int = 3):
         """batch_features: the raw per-doc feature dicts (entity_pos, hts,
         edge_cat, edge_dist, adj, entity_types, sent_spans, evidence,
         num_entities, num_sentences -- edge_cat/edge_dist/adj/entity_types are
         now sized (num_entities+num_sentences)^2, see preprocess_gat.py).
         Returns (loss, logits) in training, (logits,) otherwise; logits are
-        concatenated over the batch in hts order."""
+        concatenated over the batch in hts order.
+
+        evidence_fusion: inference-time only (see _evidence_fusion_context) --
+        averages the normal full-document classifier logits with a second
+        pass over an evidence-only LCP context, no new parameters. Intended
+        to be passed by train_gat.py's predict() only, never during training
+        (it doesn't change the loss, and doubles the classifier-head compute
+        of every step for no training benefit -- it's an EIDER-style
+        prediction-time trick, not a training-time one)."""
         sequence_output, attention = self.encode(input_ids, attention_mask)
         device = input_ids.device
 
@@ -495,24 +578,13 @@ class DocREGATModel(nn.Module):
             context = joint @ seq_i  # (P, H) Localized Context Pooling
 
             g_h, g_t = g[ht[:, 0]], g[ht[:, 1]]
-            if self.use_bilinear_classifier:
-                # ATLOP-style grouped bilinear: head/tail each get their own
-                # [entity; context] projection, then a block-wise outer product
-                # captures many more cross-terms than a single g_h*g_t. Replaces
-                # the interaction term entirely (see __init__ comment).
-                hs = torch.tanh(self.head_extractor(torch.cat([g_h, context], dim=-1)))
-                ts = torch.tanh(self.tail_extractor(torch.cat([g_t, context], dim=-1)))
-                b1 = hs.view(-1, self.emb_size // self.block_size, self.block_size)
-                b2 = ts.view(-1, self.emb_size // self.block_size, self.block_size)
-                bl = (b1.unsqueeze(3) * b2.unsqueeze(2)).view(-1, self.emb_size * self.block_size)
-                logits = self.bilinear(bl)
-            else:
-                parts = [g_h, g_t, g_h * g_t]
-                if self.use_abs_diff:
-                    parts.append(torch.abs(g_h - g_t))
-                parts.append(context)
-                pair = torch.cat(parts, dim=-1)  # (P, 4H or 5H)
-                logits = self.classifier(self.pair_proj(pair))
+            logits = self._classify(g_h, g_t, context)
+
+            if evidence_fusion and f["num_sentences"] > 0:
+                context_ev = self._evidence_fusion_context(
+                    context, joint, seq_i, sent_emb, f["sent_spans"], evidence_fusion_top_k)
+                logits_ev = self._classify(g_h, g_t, context_ev)
+                logits = (logits + logits_ev) / 2
 
             if self.use_pair_graph:
                 # second graph stage: nodes = this doc's (h,t) pairs, not entities.

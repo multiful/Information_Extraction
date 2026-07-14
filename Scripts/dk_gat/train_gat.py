@@ -78,15 +78,23 @@ def make_collate_fn(pad_token_id: int):
 
 
 @torch.no_grad()
-def predict(model, loader, id2rel, device):
+def predict(model, loader, id2rel, device, evidence_fusion=False, evidence_fusion_top_k=3):
     """Adaptive-Thresholding decode: a relation is emitted iff its logit beats
     the pair's own learned TH (class 0) logit -- no global threshold, matches
-    Scripts/atlop/train_re.py's predict()."""
+    Scripts/atlop/train_re.py's predict().
+
+    evidence_fusion: EIDER-style inference-time fusion (see model.py's
+    DocREGATModel.forward docstring) -- no new parameters, so it's valid to
+    turn on for ANY already-trained checkpoint, not just future runs. Passed
+    here (not baked into forward()'s default) so every dev-eval call during
+    training (run_stage) can optionally use it too, letting early-stopping
+    and best-checkpoint selection reflect the fused score if enabled."""
     model.eval()
     out = []
     for batch in loader:
         logits = model(batch["input_ids"].to(device), batch["attention_mask"].to(device),
-                       batch["features"])[0]
+                       batch["features"], evidence_fusion=evidence_fusion,
+                       evidence_fusion_top_k=evidence_fusion_top_k)[0]
         # get_label is inherited unchanged by PUATLoss from ATLoss, so this works
         # regardless of which loss_fnt is currently attached to the model.
         mask = model.loss_fnt.get_label(logits, num_labels=-1).cpu().numpy()
@@ -131,7 +139,8 @@ def build_param_groups(model, lr, weight_decay, layerwise_lr_decay):
 
 def run_stage(model, loader, args, device, epochs, stage, dev_loader, dev_docs, ign_docs, id2rel,
              best_ckpt_path=None, lr=None, freeze_encoder_epochs=0, evidence_start_epoch=0,
-             early_stop_patience=0, na_weight_schedule=None):
+             early_stop_patience=0, na_weight_schedule=None, evidence_fusion=False,
+             evidence_fusion_top_k=3):
     """best_ckpt_path: if given, save model.state_dict() there every time a new
     best dev F1 is seen (separate from the caller's own final-epoch save) --
     epoch-to-epoch dev F1 isn't monotonic (we've observed real dips, e.g.
@@ -191,7 +200,8 @@ def run_stage(model, loader, args, device, epochs, stage, dev_loader, dev_docs, 
                 na_w_msg = f" na_weight={model.loss_fnt.na_weight:.3f}" if apply_na_schedule else ""
                 print(f"  [{stage}] epoch {epoch} step {step + 1}/{len(loader)} "
                       f"loss {running / (step + 1):.4f}{na_w_msg}", flush=True)
-        preds = predict(model, dev_loader, id2rel, device)
+        preds = predict(model, dev_loader, id2rel, device,
+                        evidence_fusion=evidence_fusion, evidence_fusion_top_k=evidence_fusion_top_k)
         metrics = evaluate(preds, dev_docs, ign_docs)
         is_best = metrics["f1"] > best_f1
         print(f"[{stage} | epoch {epoch}] train_loss={running / max(1, len(loader)):.4f} "
@@ -282,10 +292,20 @@ def train(args):
         if args.curriculum_na_weight and not args.use_pu_loss:
             print("[warning] --curriculum_na_weight has no effect without --use_pu_loss "
                   "(plain ATLoss has no na_weight to anneal)", flush=True)
+        # freeze_encoder_epochs is NOT applied here (stage 1) even if requested --
+        # distant_epochs defaults to 1 (matching the atlop baseline's controlled
+        # schedule), so "freeze the first N epochs" would freeze the ENTIRE distant
+        # stage. That defeats distant pretraining's whole point (adapting the encoder
+        # to noisy-but-large in-domain data before the small annotated set) and, on a
+        # real run (dk_gat_v2, 2026-07-14), measurably dragged down stage-1 dev F1
+        # (37.44 vs the prior 50.08 without freezing) and every following annotated
+        # epoch tracked ~3+ F1 behind the equivalent un-frozen run. Only apply the
+        # freeze to stage 2 below, where "first 1 of 15 epochs" is a small, sensible
+        # warm-up cost instead of "100% of the stage."
         stage1_metrics, stage1_preds = run_stage(
             model, distant_loader, args, device, args.distant_epochs,
             "distant-pretrain", dev_loader, dev_docs, train_docs, id2rel,
-            best_ckpt_path=stage1_best, freeze_encoder_epochs=args.freeze_encoder_epochs,
+            best_ckpt_path=stage1_best, freeze_encoder_epochs=0,
             evidence_start_epoch=args.evidence_start_epoch,
             early_stop_patience=args.early_stop_patience,
             na_weight_schedule=na_weight_schedule)
@@ -309,7 +329,9 @@ def train(args):
                                    best_ckpt_path=best_ckpt, lr=args.lr2,
                                    freeze_encoder_epochs=args.freeze_encoder_epochs,
                                    evidence_start_epoch=args.evidence_start_epoch,
-                                   early_stop_patience=args.early_stop_patience)
+                                   early_stop_patience=args.early_stop_patience,
+                                   evidence_fusion=args.evidence_fusion,
+                                   evidence_fusion_top_k=args.evidence_fusion_top_k)
     else:
         # --epochs 0: quick distant-only screening run (e.g. na_weight/gat_heads
         # sweeps) -- matches Scripts/atlop/train_re.py's same convention. Falls
@@ -337,7 +359,9 @@ def train(args):
               flush=True)
         if best_ckpt is not None and best_ckpt.exists():
             model.load_state_dict(torch.load(best_ckpt, map_location=device))
-            best_preds = predict(model, dev_loader, id2rel, device)
+            best_preds = predict(model, dev_loader, id2rel, device,
+                                 evidence_fusion=args.evidence_fusion,
+                                 evidence_fusion_top_k=args.evidence_fusion_top_k)
             best_pred_path = RESULTS_DIR / f"{args.run_name}_best_dev_predictions.json"
             with open(best_pred_path, "w", encoding="utf-8") as fp:
                 json.dump(best_preds, fp, ensure_ascii=False)
@@ -405,6 +429,21 @@ def build_argparser():
                    help="pair-graph node feature dim (use_pair_graph only)")
     p.add_argument("--pair_graph_heads", type=int, default=4,
                    help="pair-graph attention heads (use_pair_graph only)")
+    p.add_argument("--evidence_fusion", action="store_true",
+                   help="EIDER-style (Xie et al., Findings ACL 2022) inference-time fusion: "
+                        "average the normal full-document prediction with a second prediction "
+                        "made from an evidence-only LCP context (evidence sentences predicted "
+                        "unsupervised from the model's own context/sentence similarity, no "
+                        "gold evidence needed -- works at test time too). No new trainable "
+                        "parameters -- cheap approximation reusing this forward pass's cached "
+                        "encoder output instead of a second BERT pass over a reconstructed "
+                        "document, see model.py's DocREGATModel.forward docstring. Applied "
+                        "during every annotated-stage dev eval (so early-stop/best-checkpoint "
+                        "selection reflects it) and the final best-checkpoint prediction. Off "
+                        "by default -- new, CPU smoke-tested only")
+    p.add_argument("--evidence_fusion_top_k", type=int, default=3,
+                   help="number of predicted-evidence sentences kept per pair for "
+                        "--evidence_fusion (capped at the doc's actual sentence count)")
     p.add_argument("--evidence_weight", type=float, default=0.2)
     p.add_argument("--evidence_start_epoch", type=int, default=0,
                    help="curriculum: evidence contrastive loss is added only from this "
@@ -414,9 +453,13 @@ def build_argparser():
                         "signal before the model has learned basic entity/relation cues")
     p.add_argument("--freeze_encoder_epochs", type=int, default=0,
                    help="freeze the BERT encoder's parameters for this many epochs at the "
-                        "start of each stage (0 = never freeze, current behavior) -- lets the "
-                        "GAT/classifier head warm up on a stable pretrained representation "
-                        "before the encoder itself starts moving")
+                        "start of ANNOTATED fine-tune only (0 = never freeze, current "
+                        "behavior) -- lets the GAT/classifier head warm up on a stable "
+                        "pretrained representation before the encoder itself starts moving. "
+                        "NOT applied to the distant stage regardless of this value -- "
+                        "distant_epochs defaults to 1, so freezing there would freeze the "
+                        "entire stage and defeat its purpose (measured real cost: stage-1 "
+                        "dev F1 37.44 vs 50.08 without freezing, dk_gat_v2 2026-07-14)")
     p.add_argument("--lr2", type=float, default=None,
                    help="separate learning rate for stage 2 (annotated fine-tune); defaults "
                         "to --lr (current behavior, unset) if not given. Fine-tune stages "
