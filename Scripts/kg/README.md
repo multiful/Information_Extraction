@@ -1,6 +1,6 @@
 # Knowledge Graph 적재 (`Scripts/kg/`)
 
-> **최종 업데이트**: 2026-07-14: 1단계(Ground Truth 적재) 스크립트 `load_ground_truth.py` 작성 및 Neo4j Aura 실적재 완료 (개체 47,869 / 관계 45,785).
+> **최종 업데이트**: 2026-07-14: 관계 엣지를 단일 `:RELATION` 타입에서 `relation_name` 기반 동적 타입(`:COUNTRY`, `:AUTHOR` 등)으로 마이그레이션 — Neo4j Browser/Bloom에서 caption 설정 없이도 관계 이름이 라벨로 보이도록 개선.
 
 ## 1단계: 확실한 정보 적재 (Ground Truth)
 
@@ -12,7 +12,8 @@
 ### 그래프 스키마
 
 - 노드: `(:Entity {id, name, type, aliases})` — `id = "{정규화된 이름}::{type}"`, `aliases`는 클러스터 내 모든 mention 표기.
-- 엣지: `(:Entity)-[:RELATION {relation_id, relation_name, confidence, sources}]->(:Entity)` — `confidence`는 이 단계에서 항상 `1.0`.
+- 엣지: `(:Entity)-[:<RELATION_TYPE> {relation_id, relation_name, confidence, sources}]->(:Entity)` — `<RELATION_TYPE>`은 `relation_name`을 슬러그화(UPPER_SNAKE_CASE)한 동적 관계 타입(예: `country` → `:COUNTRY`, 96개 존재). `confidence`는 이 단계에서 항상 `1.0`.
+- Neo4j Browser에서 노드 이름을 보려면 결과 화면 하단 범례의 `Entity` 항목 → Caption을 `name`으로 지정 (엣지는 타입 자체가 관계 이름이라 별도 설정 불필요).
 
 ### 실행
 
