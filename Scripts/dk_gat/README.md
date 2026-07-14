@@ -1,28 +1,81 @@
 # dk EGAT 모델 — 제안 아키텍처 파이프라인 문서
 
-> **최종 업데이트**: 2026-07-14 (Gated Fusion / Bilinear Classifier / abs-diff 구현 + 학습 전략
-> 플래그 추가, 전부 토글식 — A/B 검증 전까지 기본값은 변경 없음):
+> **최종 업데이트**: 2026-07-14 (예전 실행 결과 뒤늦게 발견 + 기록): `colab_gat_a100.ipynb` 셀
+> 4의 예전 출력(Heterogeneous graph + interaction term, JK/Gated Fusion/Bilinear 없음)이 실은
+> 이미 15 epoch 전부 완료돼 있었음 — **dev F1 60.27(final epoch)/60.29(best epoch 13), Ign F1
+> 58.41/58.39로 baseline(61.71/59.86)보다 낮음**. Gated Fusion(+2.2 F1)·Bilinear
+> Classifier(+3.67 F1) 스크리닝 결과가 이 60.29를 baseline 이상으로 끌어올릴 걸로 기대되지만,
+> **`results/comparison.md`에 이미 기록된 선례**(PU loss가 distant-only 스크리닝에서 +2.93 F1이었다가
+> 실제 파인튜닝 후엔 +0.35로 줄어든 사례)를 감안하면 스크리닝 이득이 그대로 다 전이된다는 보장은
+> 없음 — 다음 전체 실행(Gated Fusion+Bilinear 반영)이 실제 확인 수단.
 >
-> **JK A/B 1차 결과 (distant 3,000문서 스크리닝)**: JK off가 JK on보다 우세 (F1 26.77 vs 25.32,
-> Ign 25.81 vs 24.60) — 다만 Gated Fusion이 JK의 결합 단계를 대체하는 관계라(코드 주석 참고),
-> 최종 채택 여부는 Gated Fusion A/B 결과까지 보고 함께 결정 예정. 지금은 JK 기본값(on) 유지.
+> 이전 (Gated Fusion / Bilinear Classifier / abs-diff 구현 + 학습 전략 플래그 추가, 전부 토글식
+> — A/B 검증 전까지 기본값은 변경 없음):
 >
-> **⭐ Gated Fusion** (`--use_gated_fusion`, 기본 off): GAT 출력과 원본(pre-GAT) 엔티티 임베딩을
-> 학습 가능한 per-dimension sigmoid 게이트로 blend — `gate=sigmoid(W[e_orig;e_gat])`,
-> `g=gate*e_gat+(1-gate)*e_orig`. GAT 메시지패싱이 강한 엔티티 표현을 이웃과 평균내며 희석시킬 수
-> 있다는 우려에 대응, JK의 max 결합 대신 학습된 결합을 씀 (JK보다 우선 적용). A/B 진행 중
-> (`logs/gate_ab.log`).
+> **✅ Gated Fusion A/B 결론 (distant 3,000문서 스크리닝, 2026-07-14 15:29 완료) — 채택 확정**:
 >
-> **⭐ ATLOP식 Grouped Bilinear Classifier** (`--use_bilinear_classifier`, 기본 off): 기존
-> concat+`g_h*g_t`+MLP 분류 경로를 대체 — head/tail extractor(Linear+tanh) 후 block-wise outer
-> product(12블록×64) → Linear(768*64→97). 학습 곡선이 정상(loss 꾸준히 감소, 불안정 없음)이라 GAT
-> 자체보다 분류기 용량이 병목일 가능성에 대응. interaction term과 중복이라 대체(스택 안 함).
-> A/B 대기 중 (`logs/bilinear_ab.log`, Gated Fusion A/B 완료 후 자동 시작).
+> | 설정 | dev F1 | Ign F1 | Precision | Recall |
+> |---|---|---|---|---|
+> | baseline (JK on, gate 없음) | 25.16 | 24.45 | 59.50 | 15.95 |
+> | **Gated Fusion** | **27.38** | **26.47** | 56.50 | 18.07 |
+>
+> F1 +2.2 / Ign F1 +2.0 (precision 소폭 하락하지만 recall 개선폭이 커 순이익). 앞서 나온 JK
+> on/off 스크리닝 결과(F1 26.77 vs 25.32)보다도 둘 다 앞섬 — Gated Fusion이 JK의 결합 단계를
+> 코드상 완전히 대체하므로(`use_gated_fusion`이 `use_jk`보다 우선 적용, 둘을 스택하지 않음)
+> **JK on/off 논쟁 자체가 무의미해짐**. **다음 전체 Colab 실행부터 `--use_gated_fusion` 필수
+> 추가로 결론.**
+>
+> **⭐ Gated Fusion** (`--use_gated_fusion`, argparse 기본값은 여전히 off — `--use_pu_loss`와
+> 같은 패턴으로, 학습 커맨드에 명시적으로 플래그를 추가하는 방식 유지): GAT 출력과 원본(pre-GAT)
+> 엔티티 임베딩을 학습 가능한 per-dimension sigmoid 게이트로 blend —
+> `gate=sigmoid(W[e_orig;e_gat])`, `g=gate*e_gat+(1-gate)*e_orig`. GAT 메시지패싱이 강한 엔티티
+> 표현을 이웃과 평균내며 희석시킬 수 있다는 우려에 대응, JK의 max 결합 대신 학습된 결합을 씀.
+>
+> **✅ Bilinear Classifier A/B 결론 (distant 3,000문서 스크리닝, 2026-07-14 15:59 완료) — 채택
+> 확정, 지금까지 중 가장 큰 개선폭**:
+>
+> | 설정 | dev F1 | Ign F1 | Precision | Recall |
+> |---|---|---|---|---|
+> | baseline (기존 concat+`g_h*g_t`+MLP) | 25.12 | 24.42 | 59.44 | 15.93 |
+> | **Bilinear Classifier** | **28.79** | **27.79** | 57.25 | 19.23 |
+>
+> F1 +3.67 / Ign F1 +3.37 (Gated Fusion의 +2.2보다 큼). Gated Fusion(엔티티 임베딩 결합 단계)과
+> Bilinear Classifier(분류기 헤드)는 코드상 서로 다른 지점을 건드리는 독립적 변경이라 함께 스택
+> 가능. **다음 전체 Colab 실행부터 `--use_bilinear_classifier` 필수 추가로 결론.**
+>
+> **⭐ ATLOP식 Grouped Bilinear Classifier** (`--use_bilinear_classifier`, argparse 기본값은
+> 여전히 off — `--use_pu_loss`와 같은 패턴): 기존 concat+`g_h*g_t`+MLP 분류 경로를 대체 —
+> head/tail extractor(Linear+tanh) 후 block-wise outer product(12블록×64) →
+> Linear(768*64→97). 학습 곡선이 정상(loss 꾸준히 감소, 불안정 없음)이라 GAT 자체보다 분류기
+> 용량이 병목일 가능성에 대응. interaction term과 중복이라 대체(스택 안 함).
+>
+> **✅ abs-diff A/B 결론 (distant 3,000문서 스크리닝, 2026-07-14 16:27 완료) — 단독으로는 이기지만
+> 최종 조합에서는 무의미**:
+>
+> | 설정 | dev F1 | Ign F1 | Precision | Recall |
+> |---|---|---|---|---|
+> | baseline (abs-diff 없음) | 25.20 | 24.49 | 59.51 | 15.98 |
+> | **abs-diff 추가** | **27.92** | **26.95** | 57.77 | 18.41 |
+>
+> F1 +2.72 / Ign F1 +2.46 — MLP+interaction 경로 단독으로 보면 확실한 개선. **하지만**
+> `use_bilinear_classifier`가 켜지면 `pair_proj` MLP 경로 자체를 안 타므로 `use_abs_diff`는
+> 완전히 무시됨(코드: `forward()`의 `if self.use_bilinear_classifier: ... else: (abs-diff는 여기
+> 안에서만 적용)`). 이미 Bilinear Classifier(F1 28.79)가 abs-diff(27.92)보다도 앞서 채택
+> 확정됐으므로, **JK가 Gated Fusion으로 무의미해진 것과 같은 패턴 — 최종 추천 조합에서 abs-diff는
+> 넣으나 안 넣으나 결과가 같음(bilinear 경로에서 그냥 무시되는 죽은 플래그)**. `--use_abs_diff`는
+> 넣지 않음.
 >
 > **⭐ Pair Representation에 `abs(g_h-g_t)` 추가** (`--use_abs_diff`, 기본 off): 기존
 > `[g_h;g_t;g_h*g_t;c_ht]`에 InferSent 스타일 절대차 항을 추가 — 곱 항이 못 잡는 "head/tail 특징
-> 크기 차이" 신호. bilinear classifier 사용 시엔 무시(그 경로는 pair_proj를 안 씀). A/B 대기 중
-> (`logs/absdiff_ab.log`, Bilinear A/B 완료 후 자동 시작).
+> 크기 차이" 신호. bilinear classifier 사용 시엔 무시(그 경로는 pair_proj를 안 씀).
+>
+> ---
+>
+> **🏁 A/B 큐 최종 결론 — 다음 전체 Colab 실행(distant_limit=20000, epochs=15)에 반영할 조합**:
+> `--use_gated_fusion --use_bilinear_classifier` (abs-diff/JK는 위 이유로 미포함).
+> 학습 전략 플래그(`--lr2`/`--layerwise_lr_decay`/`--freeze_encoder_epochs`/
+> `--evidence_start_epoch`/`--early_stop_patience`)는 CPU 스크리닝으로 검증 불가능한 항목이라
+> 이번 실행엔 미포함, 사용자 확인 후 결정.
 >
 > **학습 전략 플래그 (신규, 기본값은 전부 현재 동작 그대로 — off/미변경)**: `--lr2`(stage2 전용
 > learning rate, 미지정 시 `--lr`과 동일), `--layerwise_lr_decay`(BERT 층별 LR 감쇠, 1.0=비활성),
