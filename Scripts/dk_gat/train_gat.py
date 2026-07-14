@@ -103,12 +103,19 @@ def predict(model, loader, id2rel, device):
     return out
 
 
-def run_stage(model, loader, args, device, epochs, stage, dev_loader, dev_docs, ign_docs, id2rel):
+def run_stage(model, loader, args, device, epochs, stage, dev_loader, dev_docs, ign_docs, id2rel,
+             best_ckpt_path=None):
+    """best_ckpt_path: if given, save model.state_dict() there every time a new
+    best dev F1 is seen (separate from the caller's own final-epoch save) --
+    epoch-to-epoch dev F1 isn't monotonic (we've observed real dips, e.g.
+    epoch 6 59.85 -> epoch 7 59.57 on a real run), so whichever epoch happens
+    to be last isn't guaranteed to be the best one actually reached."""
     total_steps = max(1, len(loader) * epochs)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = get_linear_schedule_with_warmup(
         optimizer, int(total_steps * args.warmup_ratio), total_steps)
     metrics, preds = None, None
+    best_f1, best_epoch = -1.0, -1
     for epoch in range(epochs):
         model.train()
         running = 0.0
@@ -126,9 +133,18 @@ def run_stage(model, loader, args, device, epochs, stage, dev_loader, dev_docs, 
                       f"loss {running / (step + 1):.4f}", flush=True)
         preds = predict(model, dev_loader, id2rel, device)
         metrics = evaluate(preds, dev_docs, ign_docs)
+        is_best = metrics["f1"] > best_f1
         print(f"[{stage} | epoch {epoch}] train_loss={running / max(1, len(loader)):.4f} "
               f"dev_F1={metrics['f1'] * 100:.2f} Ign_F1={metrics['ign_f1'] * 100:.2f} "
-              f"(P={metrics['precision'] * 100:.2f} R={metrics['recall'] * 100:.2f})", flush=True)
+              f"(P={metrics['precision'] * 100:.2f} R={metrics['recall'] * 100:.2f})"
+              f"{'  <- new best' if is_best else ''}", flush=True)
+        if is_best:
+            best_f1, best_epoch = metrics["f1"], epoch
+            if best_ckpt_path is not None:
+                torch.save(model.state_dict(), best_ckpt_path)
+    if best_ckpt_path is not None:
+        print(f"[{stage}] best epoch = {best_epoch} (dev_F1={best_f1 * 100:.2f}), "
+              f"saved to {best_ckpt_path}", flush=True)
     return metrics, preds
 
 
@@ -177,32 +193,49 @@ def train(args):
         distant_loader = DataLoader(build_gat_features(distant_docs, tokenizer, rel2id),
                                     batch_size=args.distant_batch_size, shuffle=True,
                                     collate_fn=collate)
+        RESULTS_DIR.mkdir(exist_ok=True)
+        stage1_best = RESULTS_DIR / f"{args.run_name}_stage1_best.pt" if args.save_model else None
         run_stage(model, distant_loader, args, device, args.distant_epochs,
-                  "distant-pretrain", dev_loader, dev_docs, train_docs, id2rel)
+                  "distant-pretrain", dev_loader, dev_docs, train_docs, id2rel,
+                  best_ckpt_path=stage1_best)
         del distant_loader, distant_docs
         if args.save_model:
-            RESULTS_DIR.mkdir(exist_ok=True)
             p = RESULTS_DIR / f"{args.run_name}_stage1.pt"
             torch.save(model.state_dict(), p)
-            print(f"[saved] {p}", flush=True)
+            print(f"[saved] {p}  (final distant epoch, not necessarily best -- "
+                  f"see {stage1_best} for that)", flush=True)
         # annotated's Na labels are gold, not distant-supervision noise -- always
         # plain ATLoss for stage 2, matching Scripts/atlop/train_re.py.
         model.loss_fnt = ATLoss()
 
     print(f"[stage 2] annotated fine-tune on {len(train_docs)} docs ({args.epochs} epoch(s))",
           flush=True)
+    RESULTS_DIR.mkdir(exist_ok=True)
+    best_ckpt = RESULTS_DIR / f"{args.run_name}_best.pt" if args.save_model else None
     metrics, preds = run_stage(model, train_loader, args, device, args.epochs,
-                               "annotated-finetune", dev_loader, dev_docs, train_docs, id2rel)
+                               "annotated-finetune", dev_loader, dev_docs, train_docs, id2rel,
+                               best_ckpt_path=best_ckpt)
 
     RESULTS_DIR.mkdir(exist_ok=True)
     pred_path = RESULTS_DIR / f"{args.run_name}_dev_predictions.json"
     with open(pred_path, "w", encoding="utf-8") as fp:
         json.dump(preds, fp, ensure_ascii=False)
-    print(f"[saved] {pred_path}  ({len(preds)} predicted relations)", flush=True)
+    print(f"[saved] {pred_path}  ({len(preds)} predicted relations, final epoch)", flush=True)
     if args.save_model:
         ckpt = RESULTS_DIR / f"{args.run_name}.pt"
         torch.save(model.state_dict(), ckpt)
-        print(f"[saved] {ckpt}", flush=True)
+        print(f"[saved] {ckpt}  (final epoch -- see {best_ckpt} for the best-dev-F1 epoch)",
+              flush=True)
+        if best_ckpt is not None and best_ckpt.exists():
+            model.load_state_dict(torch.load(best_ckpt, map_location=device))
+            best_preds = predict(model, dev_loader, id2rel, device)
+            best_pred_path = RESULTS_DIR / f"{args.run_name}_best_dev_predictions.json"
+            with open(best_pred_path, "w", encoding="utf-8") as fp:
+                json.dump(best_preds, fp, ensure_ascii=False)
+            best_metrics = evaluate(best_preds, dev_docs, train_docs)
+            print(f"[best checkpoint] dev_F1={best_metrics['f1'] * 100:.2f} "
+                  f"Ign_F1={best_metrics['ign_f1'] * 100:.2f} -- "
+                  f"saved {best_pred_path} ({len(best_preds)} predicted relations)", flush=True)
     return metrics
 
 

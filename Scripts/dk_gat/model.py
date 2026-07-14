@@ -1,7 +1,8 @@
 """dk EGAT model: BERT encoder + ATLOP-style entity/context pooling +
-2-layer Edge-featured GAT + 2-layer MLP classifier, trained with
-Adaptive Thresholding (ATLoss / PUATLoss) + 0.2 x Evidence Contrastive Loss
-(InfoNCE over the document's sentences).
+2-layer Edge-featured GAT over a heterogeneous Entity+Sentence graph +
+2-layer MLP classifier, trained with Adaptive Thresholding (ATLoss /
+PUATLoss) + 0.2 x Evidence Contrastive Loss (InfoNCE over the document's
+sentences).
 
 Implements the user-specified proposed architecture (see README.md in this
 folder for the full pipeline doc and the interpretation decisions):
@@ -9,12 +10,29 @@ folder for the full pipeline doc and the interpretation decisions):
   encoder      bert-base-cased (eager attention -- LCP needs attention maps),
                long docs handled by Scripts/atlop/long_input.process_long_input
   entity emb   mention token-span average -> mean over mentions (768)
-  pair context ATLOP Localized Context Pooling from last-layer attention (768)
-  EGAT         2 layers over the entity graph; attention score
+  sentence emb mean over each sentence's own token span (768) -- same pooling
+               shape as entity emb so both can sit in one node-feature matrix
+  EGAT         2 layers over the heterogeneous graph (entity nodes + sentence
+               nodes, see Scripts/dk_gat/preprocess_gat.py's module docstring
+               for the edge scheme); attention score
                a^T [W h_i || W h_j || W_e e_ij] per head, edge embedding 32-d
                (edge category 8 + distance bucket 8 + type_i 8 + type_j 8);
-               residual + LayerNorm each layer, GELU+dropout after layer 1 only
-  pair repr    Linear([g_h ; g_t ; c_ht], 2304 -> 768)
+               residual + LayerNorm each layer, GELU+dropout after layer 1
+               only. Only the entity rows of the GAT output are kept
+               afterwards -- sentence nodes exist purely to let two entities
+               that never co-occur directly exchange information after 2
+               layers by routing through a sentence node they both touch
+               (e.g. Steve Jobs -[S1]- Apple -[S2]- California), which an
+               entity-only graph couldn't do without a direct or same-type
+               edge between them.
+  pair context ATLOP Localized Context Pooling from last-layer attention (768)
+  pair repr    Linear([g_h ; g_t ; g_h*g_t ; c_ht], 3072 -> 768) -- the added
+               element-wise product term lets the classifier see multiplicative
+               head/tail feature interactions directly, not just their
+               concatenation (standard relation-classification trick, akin to
+               the bilinear/DistMult-style interaction ATLOP's own grouped
+               bilinear classifier uses, but explicit here as a single term
+               instead of a block-bilinear expansion).
   classifier   LayerNorm -> Linear(768,768) -> GELU -> Dropout -> Linear(768,97)
   loss         Adaptive Thresholding (class 0 = learned TH/Na, see
                Scripts/atlop/losses.py) -- train_gat.py injects PUATLoss
@@ -32,7 +50,11 @@ for RoBERTa+LCP+ATLoss on the same 20k subset, see
 Scripts/models/EXPERIMENTS.md experiment 2) -- BCE + post-hoc threshold only
 handles DocRED's 97% NA imbalance at decision time, not during training,
 so positive-class logits stayed undertrained. Adaptive Thresholding bakes
-the NA-vs-relation decision into the loss itself.
+the NA-vs-relation decision into the loss itself. The heterogeneous graph
+and the g_h*g_t interaction term were added afterwards, once this fix was
+confirmed to recover dev F1 into the expected range (46.58 distant-only,
+see Scripts/dk_gat/README.md) -- kept as a separate, later change so the
+two effects (loss fix vs. graph/interaction upgrade) aren't conflated.
 
 Prediction: ATLoss.get_label(logits) -- a relation is emitted iff its logit
 exceeds the learned per-pair TH (class 0) logit, capped at top-4. No global
@@ -115,7 +137,8 @@ class DocREGATModel(nn.Module):
         self.gat1 = EdgeFeaturedGATLayer(hidden, EDGE_EMB_DIM, num_heads, dropout, final_gelu=True)
         self.gat2 = EdgeFeaturedGATLayer(hidden, EDGE_EMB_DIM, num_heads, dropout, final_gelu=False)
 
-        self.pair_proj = nn.Linear(hidden * 3, hidden)
+        # [g_h ; g_t ; g_h*g_t ; c_ht] -- interaction term added, see module docstring
+        self.pair_proj = nn.Linear(hidden * 4, hidden)
         self.classifier = nn.Sequential(
             nn.LayerNorm(hidden),
             nn.Linear(hidden, hidden),
@@ -159,6 +182,19 @@ class DocREGATModel(nn.Module):
                 atts.append(head_avg[0])
         return torch.stack(embs), torch.stack(atts)  # (N, H), (N, L)
 
+    def _sentence_embeddings(self, seq_i, sent_spans_i):
+        """Per-sentence embedding (token-span average) -- same pooling shape as
+        _entities' mention pooling, so entity and sentence node features can
+        sit in one (N_ent+N_sent, H) matrix for the heterogeneous GAT. Also
+        reused (L2-normalized) as the sentence-embedding side of the evidence
+        contrastive loss, computed once per doc instead of twice."""
+        c = seq_i.size(0)
+        embs = []
+        for s, e in sent_spans_i:
+            s, e = s + self.offset, min(e + self.offset, c)
+            embs.append(seq_i[s:e].mean(0) if e > s else seq_i[0])
+        return torch.stack(embs)  # (S, H)
+
     def _edge_embeddings(self, edge_cat, edge_dist, entity_types, device):
         cat = self.cat_emb(torch.as_tensor(edge_cat, dtype=torch.long, device=device))
         dist = self.dist_emb(torch.as_tensor(edge_dist, dtype=torch.long, device=device))
@@ -168,18 +204,15 @@ class DocREGATModel(nn.Module):
         tj = types.unsqueeze(0).expand(n, n, 8)
         return torch.cat([cat, dist, ti, tj], dim=-1)  # (N, N, 32)
 
-    def _evidence_loss(self, context, hts_i, evidence_i, sent_spans_i, seq_i):
+    def _evidence_loss(self, context, hts_i, evidence_i, sent_embs, num_sents):
         """InfoNCE: pull each pair's LCP context toward its gold evidence
         sentences, against the document's other sentences. Skipped when the doc
-        has no evidence annotations (e.g. train_distant)."""
+        has no evidence annotations (e.g. train_distant). sent_embs: raw (not
+        yet normalized) per-sentence embeddings from _sentence_embeddings,
+        shared with the graph-node features so this isn't computed twice."""
         if not evidence_i:
             return None
-        c = seq_i.size(0)
-        sent_embs = []
-        for s, e in sent_spans_i:
-            s, e = s + self.offset, min(e + self.offset, c)
-            sent_embs.append(seq_i[s:e].mean(0) if e > s else seq_i[0])
-        sent_embs = F.normalize(torch.stack(sent_embs), dim=-1)  # (S, H)
+        sent_embs = F.normalize(sent_embs, dim=-1)  # (S, H)
 
         pair_pos = {ht: k for k, ht in enumerate(hts_i)}
         losses = []
@@ -187,7 +220,7 @@ class DocREGATModel(nn.Module):
             k = pair_pos.get(ht)
             if k is None:
                 continue
-            ev = [s for s in ev if s < len(sent_spans_i)]
+            ev = [s for s in ev if s < num_sents]
             if not ev:
                 continue
             ctx = F.normalize(context[k], dim=-1)
@@ -201,7 +234,9 @@ class DocREGATModel(nn.Module):
 
     def forward(self, input_ids, attention_mask, batch_features, labels=None):
         """batch_features: the raw per-doc feature dicts (entity_pos, hts,
-        edge_cat, edge_dist, adj, entity_types, sent_spans, evidence).
+        edge_cat, edge_dist, adj, entity_types, sent_spans, evidence,
+        num_entities, num_sentences -- edge_cat/edge_dist/adj/entity_types are
+        now sized (num_entities+num_sentences)^2, see preprocess_gat.py).
         Returns (loss, logits) in training, (logits,) otherwise; logits are
         concatenated over the batch in hts order."""
         sequence_output, attention = self.encode(input_ids, attention_mask)
@@ -210,11 +245,15 @@ class DocREGATModel(nn.Module):
         all_logits, ev_losses = [], []
         for i, f in enumerate(batch_features):
             seq_i, att_i = sequence_output[i], attention[i]
+            n_ent = f["num_entities"]
             ent_emb, ent_att = self._entities(seq_i, att_i, f["entity_pos"])
+            sent_emb = self._sentence_embeddings(seq_i, f["sent_spans"])
+            node_emb = torch.cat([ent_emb, sent_emb], dim=0)  # (n_ent+n_sent, H)
 
             edge_emb = self._edge_embeddings(f["edge_cat"], f["edge_dist"], f["entity_types"], device)
             adj = torch.as_tensor(f["adj"], dtype=torch.bool, device=device)
-            g = self.gat2(self.gat1(ent_emb, edge_emb, adj), edge_emb, adj)  # (N, H)
+            g_all = self.gat2(self.gat1(node_emb, edge_emb, adj), edge_emb, adj)  # (n_ent+n_sent, H)
+            g = g_all[:n_ent]  # sentence nodes only mediate message passing, drop them here
 
             ht = torch.as_tensor(f["hts"], dtype=torch.long, device=device).reshape(-1, 2)
             h_att = ent_att[ht[:, 0]]
@@ -223,12 +262,13 @@ class DocREGATModel(nn.Module):
             joint = joint / (joint.sum(1, keepdim=True) + 1e-30)
             context = joint @ seq_i  # (P, H) Localized Context Pooling
 
-            pair = torch.cat([g[ht[:, 0]], g[ht[:, 1]], context], dim=-1)
+            g_h, g_t = g[ht[:, 0]], g[ht[:, 1]]
+            pair = torch.cat([g_h, g_t, g_h * g_t, context], dim=-1)  # (P, 4H)
             logits = self.classifier(self.pair_proj(pair))
             all_logits.append(logits)
 
             if labels is not None:
-                ev = self._evidence_loss(context, f["hts"], f["evidence"], f["sent_spans"], seq_i)
+                ev = self._evidence_loss(context, f["hts"], f["evidence"], sent_emb, f["num_sentences"])
                 if ev is not None:
                     ev_losses.append(ev)
 
