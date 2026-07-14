@@ -1,3 +1,15 @@
+"""End-to-end correctness check for the ATLOP pipeline on CPU.
+
+This does NOT measure accuracy — it uses a tiny RANDOM-init BERT (no pretrained
+download) on a handful of dev docs to prove every stage wires up correctly:
+preprocessing + `*` markers -> encoder -> log-sum-exp entity pooling ->
+localized context pooling -> bilinear classifier -> ATLoss (forward+backward) ->
+get_label -> common prediction format -> shared scorer.
+
+Run:  python -m Scripts.atlop.smoke_test
+Real F1 numbers come from train_re.py with a real pretrained encoder on GPU.
+"""
+
 import sys
 from pathlib import Path
 
@@ -34,18 +46,21 @@ def main():
     print(f"[preprocess] doc0: input_ids={len(f0['input_ids'])} "
           f"entities={f0['num_entities']} pairs={len(f0['hts'])} "
           f"labels(sparse pos-id lists, first 3)={f0['labels'][:3]}")
+    # sanity: a marker '*' (id 115) should surround the first mention's first token
     star_id = tokenizer.convert_tokens_to_ids("*")
     first_start = f0["entity_pos"][0][0][0] + 1  # +1 for [CLS]
     assert f0["input_ids"][first_start] == star_id, "start marker not at recorded position"
     print(f"[preprocess] marker check OK (token at entity0/mention0 start is '*')")
 
+    # tiny random encoder — offline, no pretrained weights
     config = BertConfig(
         vocab_size=tokenizer.vocab_size,
         hidden_size=EMB_SIZE, num_hidden_layers=2, num_attention_heads=4,
         intermediate_size=128, max_position_embeddings=1300,
         attn_implementation="eager",  # required for output_attentions=True
     )
-
+    # add_pooling_layer=False: we only use last_hidden_state + attentions, so the
+    # pooler would sit unused (and gradient-less). Dropping it keeps this check clean.
     encoder = BertModel(config, add_pooling_layer=False)
     config.cls_token_id = tokenizer.cls_token_id
     config.sep_token_id = tokenizer.sep_token_id
@@ -55,6 +70,7 @@ def main():
     collate = make_collate_fn(tokenizer.pad_token_id)
     batch = collate(features[:3])
 
+    # forward + loss + backward
     loss, preds = model(
         input_ids=batch["input_ids"],
         attention_mask=batch["attention_mask"],

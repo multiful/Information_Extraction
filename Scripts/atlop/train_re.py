@@ -232,6 +232,7 @@ def train(args):
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
     collate = make_collate_fn(tokenizer.pad_token_id)
 
+    # train_annotated (fine-tune stage) + dev (evaluation).
     train_docs = list(DocREDataset(args.train_split))
     dev_docs = list(DocREDataset(args.dev_split))
     if args.limit_docs > 0:
@@ -247,6 +248,8 @@ def train(args):
                               shuffle=True, collate_fn=collate)
 
     config = AutoConfig.from_pretrained(args.model_name_or_path, num_labels=NUM_CLASSES)
+    # eager attention is required so the encoder returns attention weights
+    # (localized context pooling needs them); sdpa/flash do not.
     encoder = AutoModel.from_pretrained(
         args.model_name_or_path, config=config, attn_implementation="eager"
     )
@@ -263,6 +266,8 @@ def train(args):
         return docs, build_features(docs, tokenizer, rel2id)
 
     if args.distant_mode == "pretrain":
+        # Paper order: pretrain on the big noisy distant split first, then
+        # fine-tune on the clean human-annotated split.
         distant_docs, distant_features = load_distant()
         print(f"[stage 1] distant pretrain on {len(distant_docs)} docs "
               f"({args.distant_epochs} epoch(s))")
@@ -290,10 +295,14 @@ def train(args):
         else:
             print("[stage 2] skipped (--epochs 0) -- reporting stage-1 metrics/predictions")
     else:
+        # Team recipe: supervised training on the clean annotated split first.
+        # In denoise mode this model doubles as the teacher for stage 2.
         print(f"[stage 1] annotated train on {len(train_docs)} docs ({args.epochs} epoch(s))")
         metrics, preds = run_stage(model, train_loader, args, device, args.epochs,
                                    "annotated-train", dev_loader, dev_docs, train_docs, id2rel)
 
+        # Optional stage 2: continue on train_distant AFTER stripping the
+        # labels the stage-1 teacher disagrees with (self-training-style denoising).
         if args.distant_mode == "denoise":
             distant_docs, distant_features = load_distant()
             print(f"[stage 2] distant denoise+train on {len(distant_docs)} docs "
