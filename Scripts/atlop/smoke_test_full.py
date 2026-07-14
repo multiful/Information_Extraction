@@ -1,15 +1,16 @@
-"""CPU wiring check for the integrated model (re_model_full.DocREModelFull).
+"""CPU wiring check for the rebuilt integrated model (re_model_full.DocREModelFull).
 
-Random-init tiny BERT on a few dev docs — proves the whole pipeline wires up,
-NOT accuracy. Checks:
+Random-init tiny BERT on a few dev docs — proves the whole PNG pipeline wires
+up, NOT accuracy. Checks:
 
-  1. features      - build_features_full adds sent_pos (covers the token axis)
-                     and evidence (dev docs carry gold evidence sentences).
-  2. evidence dist - per-pair p_evi is a proper distribution over sentences
-                     (>=0, sums to ~1).
-  3. fwd/bwd       - relation loss + evidence loss finite, every param reached.
-  4. evidence loss - turning evi_lambda on changes the loss vs off (the DREEAM
-                     supervision term is actually contributing).
+  1. features        - build_features_full adds sent_pos (one span per sentence)
+                       and evidence (dev docs carry gold evidence sentences).
+  2. hetero graph    - _doc_nodes builds mention/entity/sentence nodes + a typed
+                       symmetric adjacency with the key edge types present.
+  3. fwd/bwd         - relation loss + evidence contrastive loss finite, preds
+                       shape right, and every parameter receives a gradient.
+  4. evidence loss   - turning evi_lambda on changes the loss vs off (the
+                       evidence-contrastive term is actually contributing).
 
 Run:  python -m Scripts.atlop.smoke_test_full
 """
@@ -26,7 +27,7 @@ sys.path.insert(0, str(ROOT))
 from data.docred_dataset import DocREDataset            # noqa: E402
 from data.docred_io import build_rel2id, NUM_CLASSES     # noqa: E402
 from Scripts.atlop.preprocess_full import build_features_full  # noqa: E402
-from Scripts.atlop.re_model_full import DocREModelFull    # noqa: E402
+from Scripts.atlop.re_model_full import DocREModelFull, ME, MS  # noqa: E402
 from Scripts.atlop.train_full import make_collate_fn      # noqa: E402
 
 N_DOCS = 4
@@ -72,20 +73,25 @@ def main():
         entity_pos=batch["entity_pos"], hts=batch["hts"], sent_pos=batch["sent_pos"],
     )
 
-    # 2) evidence distribution sanity via the model's internal method
     model = tiny_model(tokenizer, evi_lambda=0.1)
+
+    # 2) heterogeneous node graph for doc0
     model.eval()
     with torch.no_grad():
         seq, att = model.encode(batch["input_ids"], batch["attention_mask"])
-        _, _, _, evi_list = model.get_hrt_evidence(
-            seq, att, batch["entity_pos"], batch["hts"], batch["sent_pos"])
-    p0 = evi_list[0]
-    assert (p0 >= 0).all(), "p_evi has negatives"
-    sums = p0.sum(1)
-    assert torch.allclose(sums, torch.ones_like(sums), atol=1e-4), \
-        f"p_evi must sum to 1 per pair, got {sums[:3]}"
-    print(f"[evidence dist] p_evi shape={tuple(p0.shape)} sums≈1 OK "
-          f"(gate g={torch.sigmoid(model.evi_gate).item():.3f})")
+        x0, adj, entity_att, (n_m, n_e, n_s) = model._doc_nodes(
+            seq[0], att[0], batch["entity_pos"][0], batch["sent_pos"][0])
+    exp_m = sum(len(ms) for ms in batch["entity_pos"][0])
+    assert n_e == len(batch["entity_pos"][0]) and n_s == n_sent and n_m == exp_m
+    N = n_m + n_e + n_s
+    assert x0.shape == (N, GRAPH_DIM), f"node feature shape {tuple(x0.shape)} != {(N, GRAPH_DIM)}"
+    assert adj.shape[1:] == (N, N)
+    for k in (ME, MS):
+        assert adj[k].any(), f"edge type {k} missing"
+        assert torch.equal(adj[k], adj[k].t()), f"edge type {k} not symmetric"
+    assert not adj.any(0).diagonal().any(), "adjacency must exclude self-loops"
+    print(f"[hetero graph] nodes N={N} (m={n_m} e={n_e} s={n_s}) "
+          f"edges/type={[int(adj[k].sum()) for k in range(adj.size(0))]} OK")
 
     # 3) forward/backward, all params reached
     model.train()
@@ -98,7 +104,7 @@ def main():
     print(f"[fwd/bwd] loss={loss.item():.4f}  all params have grad "
           f"(preds {tuple(preds.shape)})")
 
-    # 4) evidence term actually contributes
+    # 4) evidence contrastive term actually contributes
     m_on = tiny_model(tokenizer, evi_lambda=0.5)
     m_off = tiny_model(tokenizer, evi_lambda=0.0)
     m_off.load_state_dict(m_on.state_dict())  # identical weights
@@ -106,11 +112,11 @@ def main():
     with torch.no_grad():
         loss_on = m_on(labels=batch["labels"], evidence=batch["evidence"], **kwargs)[0]
         loss_off = m_off(labels=batch["labels"], evidence=batch["evidence"], **kwargs)[0]
-    assert loss_on.item() != loss_off.item(), "evidence loss did not change the total"
+    assert loss_on.item() != loss_off.item(), "evidence contrastive did not change the total"
     print(f"[evidence loss] evi_lambda 0.5 vs 0.0: {loss_on.item():.4f} vs "
           f"{loss_off.item():.4f}  (Δ={loss_on.item() - loss_off.item():+.4f})")
 
-    print("\nFULL SMOKE TEST PASSED - DREEAM-LCP + GREP-GAT + PU wired end-to-end.")
+    print("\nFULL SMOKE TEST PASSED - BERT node-GAT + DREAM evidence + gated MLP wired end-to-end.")
 
 
 if __name__ == "__main__":
