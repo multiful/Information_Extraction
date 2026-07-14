@@ -8,6 +8,10 @@ entity linking을 제공하지 않으므로, 동일 표기+동일 type을 같은
 관계 타입 자체로 사용한다 (예: "country" -> :COUNTRY). 이렇게 해야 Neo4j
 Browser/Bloom에서 별도 caption 설정 없이도 관계 이름이 바로 라벨로 보인다.
 
+개체 노드도 마찬가지로 `:Entity` 라벨에 더해 DocRED type(PER/ORG/LOC/TIME/NUM/MISC)을
+보조 라벨로 추가한다 (예: `(:Entity:PER)`). Bloom/Browser는 라벨 기준으로 노드를
+분류·색칠하므로, type을 속성으로만 두면 전부 "Entity" 하나로만 뭉쳐 보인다.
+
 사용법:
     python Scripts/kg/load_ground_truth.py --dry-run   # DB 연결 없이 집계만 확인
     python Scripts/kg/load_ground_truth.py              # 실제 적재
@@ -95,15 +99,18 @@ def build_graph(splits, rel_info):
 
 
 def to_entity_rows(entities):
-    return [
-        {
+    """DocRED type(예: PER)별로 그룹지어 반환 — 보조 라벨은 관계 타입과 마찬가지로
+    쿼리 문자열에 직접 넣어야 하므로 타입별로 배치를 나눈다."""
+    by_type = {}
+    for entity_id, ent in entities.items():
+        row = {
             "id": entity_id,
             "name": ent["name"],
             "type": ent["type"],
             "aliases": sorted(ent["aliases"]),
         }
-        for entity_id, ent in entities.items()
-    ]
+        by_type.setdefault(ent["type"], []).append(row)
+    return by_type
 
 
 def to_edge_rows(edges):
@@ -128,13 +135,18 @@ def chunked(rows, size):
         yield rows[i : i + size]
 
 
-ENTITY_MERGE_QUERY = """
-UNWIND $rows AS row
-MERGE (e:Entity {id: row.id})
-SET e.name = row.name, e.type = row.type, e.aliases = row.aliases
-"""
-
 TYPE_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+
+def entity_merge_query(type_label):
+    if not TYPE_NAME_RE.match(type_label):
+        raise ValueError(f"안전하지 않은 개체 타입 라벨: {type_label!r}")
+    return f"""
+UNWIND $rows AS row
+MERGE (e:Entity {{id: row.id}})
+SET e.name = row.name, e.type = row.type, e.aliases = row.aliases
+SET e:{type_label}
+"""
 
 
 def edge_merge_query(type_name):
@@ -155,7 +167,7 @@ ON MATCH SET
 """
 
 
-def load_into_neo4j(entity_rows, edge_rows_by_type, batch_size):
+def load_into_neo4j(entity_rows_by_type, edge_rows_by_type, batch_size):
     from neo4j import GraphDatabase
 
     uri = os.environ["NEO4J_URI"]
@@ -172,9 +184,13 @@ def load_into_neo4j(entity_rows, edge_rows_by_type, batch_size):
             "FOR (e:Entity) REQUIRE e.id IS UNIQUE"
         )
 
-        for batch in chunked(entity_rows, batch_size):
-            session.run(ENTITY_MERGE_QUERY, rows=batch)
-        print(f"엔티티 적재 완료: {len(entity_rows)}개")
+        total_entities = 0
+        for type_label, rows in entity_rows_by_type.items():
+            query = entity_merge_query(type_label)
+            for batch in chunked(rows, batch_size):
+                session.run(query, rows=batch)
+            total_entities += len(rows)
+        print(f"엔티티 적재 완료: {total_entities}개 ({len(entity_rows_by_type)}개 개체 타입)")
 
         # 구 스키마(:RELATION 단일 타입)로 적재된 엣지가 남아있으면 제거
         session.run("MATCH ()-[r:RELATION]->() DELETE r")
@@ -207,9 +223,10 @@ def main():
     entity_rows = to_entity_rows(entities)
     edge_rows = to_edge_rows(edges)
 
+    total_entities = sum(len(rows) for rows in entity_rows.values())
     total_edges = sum(len(rows) for rows in edge_rows.values())
     print(f"대상 split: {SPLITS}")
-    print(f"고유 개체 수 (전역 병합 후): {len(entity_rows)}")
+    print(f"고유 개체 수 (전역 병합 후): {total_entities} ({len(entity_rows)}개 개체 타입)")
     print(f"고유 관계(triple) 수 (전역 병합 후): {total_edges} ({len(edge_rows)}개 관계 타입)")
 
     if args.dry_run:

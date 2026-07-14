@@ -1,6 +1,6 @@
 # Knowledge Graph 적재 (`Scripts/kg/`)
 
-> **최종 업데이트**: 2026-07-14: 관계 엣지를 단일 `:RELATION` 타입에서 `relation_name` 기반 동적 타입(`:COUNTRY`, `:AUTHOR` 등)으로 마이그레이션 — Neo4j Browser/Bloom에서 caption 설정 없이도 관계 이름이 라벨로 보이도록 개선.
+> **최종 업데이트**: 2026-07-14: 개체 노드에 DocRED type(PER/ORG/LOC/TIME/NUM/MISC)을 `:Entity` 보조 라벨로 추가하는 마이그레이션 완료 — Bloom/Browser가 노드를 타입별로 자동 분류·색칠하도록 개선. (이전 업데이트: 관계 엣지를 단일 `:RELATION` 타입에서 `relation_name` 기반 동적 타입(`:COUNTRY`, `:AUTHOR` 등)으로 마이그레이션.)
 
 ## 1단계: 확실한 정보 적재 (Ground Truth)
 
@@ -11,9 +11,9 @@
 
 ### 그래프 스키마
 
-- 노드: `(:Entity {id, name, type, aliases})` — `id = "{정규화된 이름}::{type}"`, `aliases`는 클러스터 내 모든 mention 표기.
+- 노드: `(:Entity:<TYPE> {id, name, type, aliases})` — `id = "{정규화된 이름}::{type}"`, `aliases`는 클러스터 내 모든 mention 표기. `<TYPE>`은 DocRED type을 그대로 보조 라벨로 쓴 것(`PER`/`ORG`/`LOC`/`TIME`/`NUM`/`MISC`, 6종) — `type` 속성과 중복되지만, Bloom/Browser가 라벨 기준으로 노드를 분류·색칠하기 때문에 필요.
 - 엣지: `(:Entity)-[:<RELATION_TYPE> {relation_id, relation_name, confidence, sources}]->(:Entity)` — `<RELATION_TYPE>`은 `relation_name`을 슬러그화(UPPER_SNAKE_CASE)한 동적 관계 타입(예: `country` → `:COUNTRY`, 96개 존재). `confidence`는 이 단계에서 항상 `1.0`.
-- Neo4j Browser에서 노드 이름을 보려면 결과 화면 하단 범례의 `Entity` 항목 → Caption을 `name`으로 지정 (엣지는 타입 자체가 관계 이름이라 별도 설정 불필요).
+- Neo4j Browser에서 노드 이름을 보려면 결과 화면 하단 범례의 `Entity` 항목 → Caption을 `name`으로 지정 (엣지는 타입 자체가 관계 이름이라 별도 설정 불필요). Bloom에서는 Perspective 편집 화면에서 각 타입 카테고리의 Caption을 `name`으로 지정.
 
 ### 실행
 
@@ -29,8 +29,8 @@ python Scripts/kg/load_ground_truth.py              # 실제 Neo4j Aura 적재
 
 | 항목 | 개수 |
 |---|---|
-| 고유 개체 노드 | 47,869 |
-| 고유 관계 엣지 | 45,785 |
+| 고유 개체 노드 | 47,869 (PER 11,182 / LOC 10,755 / MISC 10,344 / ORG 8,281 / TIME 5,338 / NUM 1,969) |
+| 고유 관계 엣지 | 45,785 (96개 관계 타입) |
 
 ## 다음 단계 (미구현)
 
