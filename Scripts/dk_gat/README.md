@@ -22,11 +22,23 @@
 > `gate=sigmoid(W[e_orig;e_gat])`, `g=gate*e_gat+(1-gate)*e_orig`. GAT 메시지패싱이 강한 엔티티
 > 표현을 이웃과 평균내며 희석시킬 수 있다는 우려에 대응, JK의 max 결합 대신 학습된 결합을 씀.
 >
-> **⭐ ATLOP식 Grouped Bilinear Classifier** (`--use_bilinear_classifier`, 기본 off): 기존
-> concat+`g_h*g_t`+MLP 분류 경로를 대체 — head/tail extractor(Linear+tanh) 후 block-wise outer
-> product(12블록×64) → Linear(768*64→97). 학습 곡선이 정상(loss 꾸준히 감소, 불안정 없음)이라 GAT
-> 자체보다 분류기 용량이 병목일 가능성에 대응. interaction term과 중복이라 대체(스택 안 함).
-> A/B 진행 중 (`logs/bilinear_ab.log`, Gated Fusion A/B 완료 후 자동 시작됨).
+> **✅ Bilinear Classifier A/B 결론 (distant 3,000문서 스크리닝, 2026-07-14 15:59 완료) — 채택
+> 확정, 지금까지 중 가장 큰 개선폭**:
+>
+> | 설정 | dev F1 | Ign F1 | Precision | Recall |
+> |---|---|---|---|---|
+> | baseline (기존 concat+`g_h*g_t`+MLP) | 25.12 | 24.42 | 59.44 | 15.93 |
+> | **Bilinear Classifier** | **28.79** | **27.79** | 57.25 | 19.23 |
+>
+> F1 +3.67 / Ign F1 +3.37 (Gated Fusion의 +2.2보다 큼). Gated Fusion(엔티티 임베딩 결합 단계)과
+> Bilinear Classifier(분류기 헤드)는 코드상 서로 다른 지점을 건드리는 독립적 변경이라 함께 스택
+> 가능. **다음 전체 Colab 실행부터 `--use_bilinear_classifier` 필수 추가로 결론.**
+>
+> **⭐ ATLOP식 Grouped Bilinear Classifier** (`--use_bilinear_classifier`, argparse 기본값은
+> 여전히 off — `--use_pu_loss`와 같은 패턴): 기존 concat+`g_h*g_t`+MLP 분류 경로를 대체 —
+> head/tail extractor(Linear+tanh) 후 block-wise outer product(12블록×64) →
+> Linear(768*64→97). 학습 곡선이 정상(loss 꾸준히 감소, 불안정 없음)이라 GAT 자체보다 분류기
+> 용량이 병목일 가능성에 대응. interaction term과 중복이라 대체(스택 안 함).
 >
 > **⭐ Pair Representation에 `abs(g_h-g_t)` 추가** (`--use_abs_diff`, 기본 off): 기존
 > `[g_h;g_t;g_h*g_t;c_ht]`에 InferSent 스타일 절대차 항을 추가 — 곱 항이 못 잡는 "head/tail 특징
