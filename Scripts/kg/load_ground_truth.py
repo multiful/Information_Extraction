@@ -8,9 +8,11 @@ entity linking을 제공하지 않으므로, 동일 표기+동일 type을 같은
 관계 타입 자체로 사용한다 (예: "country" -> :COUNTRY). 이렇게 해야 Neo4j
 Browser/Bloom에서 별도 caption 설정 없이도 관계 이름이 바로 라벨로 보인다.
 
-개체 노드도 마찬가지로 `:Entity` 라벨에 더해 DocRED type(PER/ORG/LOC/TIME/NUM/MISC)을
-보조 라벨로 추가한다 (예: `(:Entity:PER)`). Bloom/Browser는 라벨 기준으로 노드를
-분류·색칠하므로, type을 속성으로만 두면 전부 "Entity" 하나로만 뭉쳐 보인다.
+개체 노드도 마찬가지로 공통 라벨(`:ZEntity`)에 더해 DocRED type(PER/ORG/LOC/TIME/NUM/MISC)을
+보조 라벨로 추가한다 (예: `(:ZEntity:PER)`). Bloom/Browser는 라벨 기준으로 노드를
+분류·색칠하는데, 다중 라벨 노드는 알파벳순으로 정렬된 첫 라벨(주로 공통 라벨)을
+기준으로 스타일을 고르는 것으로 보여, 공통 라벨 이름을 `Entity`가 아니라 `ZEntity`로
+지어서 PER/LOC/... 보다 항상 알파벳순으로 뒤에 오도록 함 (타입 라벨이 먼저 오게).
 
 사용법:
     python Scripts/kg/load_ground_truth.py --dry-run   # DB 연결 없이 집계만 확인
@@ -31,6 +33,7 @@ DATA_DIR = ROOT / "docred_data" / "data"
 
 SPLITS = ["train_annotated", "dev"]
 BATCH_SIZE = 500
+ENTITY_LABEL = "ZEntity"
 
 
 def normalize_name(name):
@@ -143,7 +146,7 @@ def entity_merge_query(type_label):
         raise ValueError(f"안전하지 않은 개체 타입 라벨: {type_label!r}")
     return f"""
 UNWIND $rows AS row
-MERGE (e:Entity {{id: row.id}})
+MERGE (e:{ENTITY_LABEL} {{id: row.id}})
 SET e.name = row.name, e.type = row.type, e.aliases = row.aliases
 SET e:{type_label}
 """
@@ -154,8 +157,8 @@ def edge_merge_query(type_name):
         raise ValueError(f"안전하지 않은 관계 타입 이름: {type_name!r}")
     return f"""
 UNWIND $rows AS row
-MATCH (h:Entity {{id: row.head_id}})
-MATCH (t:Entity {{id: row.tail_id}})
+MATCH (h:{ENTITY_LABEL} {{id: row.head_id}})
+MATCH (t:{ENTITY_LABEL} {{id: row.tail_id}})
 MERGE (h)-[r:{type_name}]->(t)
 ON CREATE SET
     r.relation_id = row.relation_id,
@@ -179,9 +182,12 @@ def load_into_neo4j(entity_rows_by_type, edge_rows_by_type, batch_size):
     driver.verify_connectivity()
 
     with driver.session(database=database) as session:
+        # 구 라벨(:Entity)로 적재된 노드가 있으면 새 공통 라벨(:ZEntity)로 이전
+        session.run(f"MATCH (e:Entity) WHERE NOT e:{ENTITY_LABEL} SET e:{ENTITY_LABEL} REMOVE e:Entity")
+        session.run("DROP CONSTRAINT entity_id_unique IF EXISTS")
         session.run(
-            "CREATE CONSTRAINT entity_id_unique IF NOT EXISTS "
-            "FOR (e:Entity) REQUIRE e.id IS UNIQUE"
+            f"CREATE CONSTRAINT {ENTITY_LABEL.lower()}_id_unique IF NOT EXISTS "
+            f"FOR (e:{ENTITY_LABEL}) REQUIRE e.id IS UNIQUE"
         )
 
         total_entities = 0

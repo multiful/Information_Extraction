@@ -1,6 +1,6 @@
 # Knowledge Graph 적재 (`Scripts/kg/`)
 
-> **최종 업데이트**: 2026-07-14: 개체 노드에 DocRED type(PER/ORG/LOC/TIME/NUM/MISC)을 `:Entity` 보조 라벨로 추가하는 마이그레이션 완료 — Bloom/Browser가 노드를 타입별로 자동 분류·색칠하도록 개선. (이전 업데이트: 관계 엣지를 단일 `:RELATION` 타입에서 `relation_name` 기반 동적 타입(`:COUNTRY`, `:AUTHOR` 등)으로 마이그레이션.)
+> **최종 업데이트**: 2026-07-14: 공통 개체 라벨을 `:Entity`에서 `:ZEntity`로 개명 — Neo4j Browser/Bloom이 다중 라벨 노드의 색을 알파벳순 첫 라벨 기준으로 정하는 것으로 보여, `PER`/`LOC`/... 보다 항상 뒤에 오도록 이름을 바꿈. Neo4j에 잘못 올라간 `:Triple`(CSV를 그래프 매핑 없이 통째로 노드화한 것) 20,528개도 제거. `Scripts/kg/export_csv.py`(Neo4j → `triples.csv` 평면 내보내기) 추가. (이전 업데이트: 개체 노드에 DocRED type을 보조 라벨로 추가, 관계 엣지를 `relation_name` 기반 동적 타입으로 마이그레이션.)
 
 ## 1단계: 확실한 정보 적재 (Ground Truth)
 
@@ -11,9 +11,10 @@
 
 ### 그래프 스키마
 
-- 노드: `(:Entity:<TYPE> {id, name, type, aliases})` — `id = "{정규화된 이름}::{type}"`, `aliases`는 클러스터 내 모든 mention 표기. `<TYPE>`은 DocRED type을 그대로 보조 라벨로 쓴 것(`PER`/`ORG`/`LOC`/`TIME`/`NUM`/`MISC`, 6종) — `type` 속성과 중복되지만, Bloom/Browser가 라벨 기준으로 노드를 분류·색칠하기 때문에 필요.
-- 엣지: `(:Entity)-[:<RELATION_TYPE> {relation_id, relation_name, confidence, sources}]->(:Entity)` — `<RELATION_TYPE>`은 `relation_name`을 슬러그화(UPPER_SNAKE_CASE)한 동적 관계 타입(예: `country` → `:COUNTRY`, 96개 존재). `confidence`는 이 단계에서 항상 `1.0`.
-- Neo4j Browser에서 노드 이름을 보려면 결과 화면 하단 범례의 `Entity` 항목 → Caption을 `name`으로 지정 (엣지는 타입 자체가 관계 이름이라 별도 설정 불필요). Bloom에서는 Perspective 편집 화면에서 각 타입 카테고리의 Caption을 `name`으로 지정.
+- 노드: `(:ZEntity:<TYPE> {id, name, type, aliases})` — `id = "{정규화된 이름}::{type}"`, `aliases`는 클러스터 내 모든 mention 표기. `<TYPE>`은 DocRED type을 그대로 보조 라벨로 쓴 것(`PER`/`ORG`/`LOC`/`TIME`/`NUM`/`MISC`, 6종) — `type` 속성과 중복되지만, Bloom/Browser가 라벨 기준으로 노드를 분류·색칠하기 때문에 필요. 공통 라벨 이름이 `Entity`가 아니라 `ZEntity`인 이유: Neo4j Browser/Bloom이 다중 라벨 노드의 스타일을 알파벳순으로 정렬된 첫 라벨 기준으로 고르는 것으로 보여, 타입 라벨(`PER`~`TIME`)이 항상 먼저 오도록 의도적으로 `Z`로 시작하는 이름을 씀.
+- 엣지: `(:ZEntity)-[:<RELATION_TYPE> {relation_id, relation_name, confidence, sources}]->(:ZEntity)` — `<RELATION_TYPE>`은 `relation_name`을 슬러그화(UPPER_SNAKE_CASE)한 동적 관계 타입(예: `country` → `:COUNTRY`, 96개 존재). `confidence`는 이 단계에서 항상 `1.0`.
+- Neo4j Browser에서 노드 이름을 보려면 결과 화면 하단 범례의 `ZEntity`/타입 항목 → Caption을 `name`으로 지정 (엣지는 타입 자체가 관계 이름이라 별도 설정 불필요). Bloom에서는 Perspective 편집 화면에서 각 타입 카테고리의 Caption을 `name`으로 지정.
+- `Scripts/kg/export_csv.py`: Neo4j에 적재된 그래프를 그대로 저장소 루트 `triples.csv` 한 파일로 내보냄 (head/relation/tail/confidence/sources 평면 구조, Excel/pandas용).
 
 ### 실행
 
