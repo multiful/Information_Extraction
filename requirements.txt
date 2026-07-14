@@ -23,3 +23,7 @@ matplotlib==3.9.4
 tqdm==4.67.3
 jupyter==1.1.1
 ipykernel==6.31.0
+
+# Knowledge Graph ingestion (Scripts/kg/load_ground_truth.py -> Neo4j Aura)
+neo4j==5.26.0
+python-dotenv==1.0.1

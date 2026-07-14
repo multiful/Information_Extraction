@@ -16,6 +16,9 @@ venv/
 # OS
 .DS_Store
 
+# Secrets (Neo4j Aura credentials, etc.)
+.env
+
 # 모델 산출물 (재생성 가능) — 예측 결과/체크포인트. comparison.md는 추적함
 results/*.json
 results/*.pt
