@@ -3,16 +3,35 @@
 Extends the marker-insertion scheme of Scripts/atlop/preprocess.py (same `*`
 markers, same entity_pos semantics — start = `*` start-marker subword index,
 end = one past the `*` end marker, both pre-[CLS] so the model adds offset=1)
-with the extra per-document structure the GAT and the evidence loss need:
+with the extra per-document structure the GAT and the evidence loss need.
+
+Graph is now **heterogeneous** (2 node types) instead of entity-only:
+
+  node 0..num_entities-1              : entity nodes (order = vertexSet)
+  node num_entities..num_entities+S-1 : sentence nodes (order = doc["sents"])
+
+so downstream code always knows entities are the first `num_entities` rows
+of any (node, ...) tensor and can slice them back out after the GAT.
 
   sent_spans   : list[(start, end)] token span of each sentence (pre-[CLS])
-  entity_types : list[int]          per entity (first mention's type)
-  edge_cat     : (N, N) int         3=self, 2=mention overlap, 1=same sentence,
-                                     0=otherwise
-  edge_dist    : (N, N) int         bucketed min sentence distance between the
-                                     two entities' mentions (0,1,2,3,4,5+)
-  adj          : (N, N) bool        sparse graph: edge iff edge_cat>0 or
-                                     dist bucket <= 2; self-loops always on
+  entity_types : list[int]          per node -- real type (0-5)/unk(6) for
+                                     entities, a single shared pseudo-type
+                                     (7) for every sentence node
+  edge_cat     : (N+S, N+S) int     4=self, 3=entity-sentence ("appears in"),
+                                     2=entity-entity mention overlap,
+                                     1=entity-entity same sentence, 0=otherwise
+  edge_dist    : (N+S, N+S) int     bucketed min sentence distance, only
+                                     meaningful for entity-entity pairs
+                                     (0,1,2,3,4,5+); 0 for any connected
+                                     entity-sentence/self edge
+  adj          : (N+S, N+S) bool    sparse graph: entity-entity edge iff
+                                     edge_cat>0 or dist bucket<=2;
+                                     entity-sentence edge iff the entity has
+                                     a mention in that sentence; self-loops
+                                     always on. No sentence-sentence edges
+                                     (multi-hop between entities routes
+                                     through a shared sentence node instead,
+                                     e.g. Steve Jobs -[S1]- Apple -[S2]- California)
   evidence     : dict[(h,t)] -> list[int]  union of gold evidence sent ids
                                      (empty dict for train_distant)
 
@@ -36,8 +55,10 @@ NUM_CLASSES = 97
 MARKER = "*"
 
 ENTITY_TYPES = {"PER": 0, "ORG": 1, "LOC": 2, "TIME": 3, "NUM": 4, "MISC": 5}
-NUM_ENTITY_TYPES = 7  # 6 known + 1 unk
-EDGE_CATS = 4         # 0 none / 1 same-sentence / 2 mention-overlap / 3 self
+SENTENCE_TYPE_ID = 7
+NUM_ENTITY_TYPES = 8  # 6 known + 1 unk(entity) + 1 shared sentence pseudo-type
+EDGE_CATS = 5         # 0 none / 1 ent-ent same-sentence / 2 ent-ent mention overlap
+                      # / 3 entity-sentence "appears in" / 4 self
 NUM_DIST_BUCKETS = 6  # 0,1,2,3,4,5+
 
 
@@ -92,9 +113,18 @@ def _encode_with_markers_and_sents(doc: dict, tokenizer: PreTrainedTokenizerBase
 
 
 def _graph_structure(doc: dict):
-    """Edge categories / distance buckets / adjacency between entity nodes."""
+    """Heterogeneous Entity+Sentence graph: nodes 0..n_ent-1 are entities
+    (vertexSet order), nodes n_ent..n_ent+n_sent-1 are sentences (doc order).
+    Returns (edge_cat, edge_dist, adj, n_ent, n_sent), all sized (n_ent+n_sent)^2.
+
+    Entities with no direct entity-entity edge can still exchange information
+    after 2 GAT layers by routing through a shared sentence node they both
+    appear in (e.g. Steve Jobs -[S1]- Apple -[S2]- California), which is the
+    whole point of adding sentence nodes -- see module docstring."""
     vs = doc["vertexSet"]
-    n = len(vs)
+    n_ent = len(vs)
+    n_sent = len(doc["sents"])
+    n = n_ent + n_sent
     ent_sents = [set(m["sent_id"] for m in e) for e in vs]
     # word-level spans per (sent, entity) for overlap detection
     ent_word_spans = [[(m["sent_id"], m["pos"][0], m["pos"][1]) for m in e] for e in vs]
@@ -102,11 +132,13 @@ def _graph_structure(doc: dict):
     edge_cat = [[0] * n for _ in range(n)]
     edge_dist = [[NUM_DIST_BUCKETS - 1] * n for _ in range(n)]
     adj = [[False] * n for _ in range(n)]
-    for i in range(n):
-        edge_cat[i][i] = 3
+
+    # entity-entity block (unchanged logic from the entity-only graph)
+    for i in range(n_ent):
+        edge_cat[i][i] = 4
         edge_dist[i][i] = 0
         adj[i][i] = True
-        for j in range(n):
+        for j in range(n_ent):
             if i == j:
                 continue
             d = min(abs(a - b) for a in ent_sents[i] for b in ent_sents[j])
@@ -123,7 +155,25 @@ def _graph_structure(doc: dict):
                         break
             edge_cat[i][j] = cat
             adj[i][j] = cat > 0 or edge_dist[i][j] <= 2  # sparse graph
-    return edge_cat, edge_dist, adj
+
+    # sentence self-loops
+    for s in range(n_sent):
+        node = n_ent + s
+        edge_cat[node][node] = 4
+        edge_dist[node][node] = 0
+        adj[node][node] = True
+
+    # entity-sentence edges: "entity appears in sentence" (symmetric).
+    # No sentence-sentence edges -- two entities in different sentences
+    # reach each other via a shared sentence node instead (see docstring).
+    for i in range(n_ent):
+        for sid in ent_sents[i]:
+            node = n_ent + sid
+            edge_cat[i][node] = edge_cat[node][i] = 3
+            edge_dist[i][node] = edge_dist[node][i] = 0
+            adj[i][node] = adj[node][i] = True
+
+    return edge_cat, edge_dist, adj, n_ent, n_sent
 
 
 def build_gat_features(
@@ -158,14 +208,18 @@ def build_gat_features(
                 hts.append((h, t))
                 labels.append(sorted(set(triples[(h, t)])) if (h, t) in triples else [0])
 
-        edge_cat, edge_dist, adj = _graph_structure(doc)
-        entity_types = [ENTITY_TYPES.get(e[0].get("type"), 6) for e in vs]
+        edge_cat, edge_dist, adj, n_ent_chk, n_sent = _graph_structure(doc)
+        assert n_ent_chk == n_ent
+        # node_types: real type per entity (0-5 known / 6 unk), then the
+        # shared sentence pseudo-type (7) for every sentence node -- so
+        # node_types has exactly n_ent + n_sent entries, matching edge_cat.
+        node_types = [ENTITY_TYPES.get(e[0].get("type"), 6) for e in vs] + [SENTENCE_TYPE_ID] * n_sent
 
         features.append({
             "input_ids": input_ids,
             "entity_pos": entity_pos,
             "sent_spans": sent_spans,
-            "entity_types": entity_types,
+            "entity_types": node_types,
             "edge_cat": edge_cat,
             "edge_dist": edge_dist,
             "adj": adj,
@@ -174,5 +228,6 @@ def build_gat_features(
             "evidence": evidence,
             "title": doc["title"],
             "num_entities": n_ent,
+            "num_sentences": n_sent,
         })
     return features
