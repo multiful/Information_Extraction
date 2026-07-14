@@ -1,8 +1,14 @@
-"""1단계: train_annotated + dev의 사람 annotate 정답 triple을 Neo4j에 confidence=1.0으로 적재.
+"""1단계: train_annotated + dev의 사람 annotate 정답 triple을 Neo4j에 적재.
 
 개체 노드는 (정규화된 이름, type) 기준으로 문서 간 전역 병합한다 (DocRED는 문서 간
 entity linking을 제공하지 않으므로, 동일 표기+동일 type을 같은 개체로 취급하는
 근사치임 — 동명이인 등은 잘못 병합될 수 있음).
+
+관계 엣지는 반대로 문서 간에 병합하지 않는다 — 같은 (head, tail, relation)
+triple이 여러 문서에서 나오면 문서 수만큼 별도 엣지를 만든다. 각 엣지가
+confidence/document/sentence_id/evidence/evidence_source를 온전한 속성으로
+가지도록 하기 위함 (LangGraph 등에서 "이 관계의 근거는?"을 물었을 때 문서별로
+바로 꺼내 쓸 수 있게). evidence 보완 로직은 docred_common.resolve_evidence 참고.
 
 관계는 rel_info.json의 relation_name을 슬러그화(UPPER_SNAKE_CASE)해 Neo4j
 관계 타입 자체로 사용한다 (예: "country" -> :COUNTRY). 이렇게 해야 Neo4j
@@ -20,24 +26,23 @@ Browser/Bloom에서 별도 caption 설정 없이도 관계 이름이 바로 라�
 """
 
 import argparse
-import json
 import os
 import re
-from collections import Counter
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-ROOT = Path(__file__).resolve().parent.parent.parent
-DATA_DIR = ROOT / "docred_data" / "data"
+from docred_common import (
+    ROOT,
+    global_entity_id,
+    iter_doc_records,
+    load_rel_info,
+    resolve_evidence,
+)
 
 SPLITS = ["train_annotated", "dev"]
 BATCH_SIZE = 500
 ENTITY_LABEL = "ZEntity"
-
-
-def normalize_name(name):
-    return " ".join(name.split())
 
 
 def relation_type_name(relation_name):
@@ -48,55 +53,47 @@ def relation_type_name(relation_name):
     return slug
 
 
-def load_split(name):
-    with open(DATA_DIR / f"{name}.json", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def load_rel_info():
-    with open(DATA_DIR / "rel_info.json", encoding="utf-8") as f:
-        return json.load(f)
-
-
 def build_graph(splits, rel_info):
-    """전체 split을 순회하며 전역 개체/관계 딕셔너리를 만든다."""
-    entities = {}  # entity_id -> {"name": str, "type": str, "aliases": set}
-    edges = {}  # (head_id, tail_id, relation_id) -> {"relation_name": str, "sources": set}
+    """entities: entity_id -> {name, type, aliases}
+    edges: (head_id, tail_id, relation_id, document)별로 하나씩, 문서 간 병합 없음."""
+    entities = {}
+    edges = []
 
-    for split in splits:
-        docs = load_split(split)
-        for doc in docs:
-            title = doc["title"]
-            vertex_to_entity_id = []
+    for split, doc, vertex_meta, mention_sents in iter_doc_records(splits):
+        title = doc["title"]
+        sents = doc["sents"]
+        vertex_to_entity_id = []
 
-            for cluster in doc["vertexSet"]:
-                names = [normalize_name(m["name"]) for m in cluster]
-                types = [m["type"] for m in cluster]
-                canonical_name = Counter(names).most_common(1)[0][0]
-                entity_type = Counter(types).most_common(1)[0][0]
-                entity_id = f"{canonical_name}::{entity_type}"
+        for i, cluster in enumerate(doc["vertexSet"]):
+            name, type_ = vertex_meta[i]
+            entity_id = global_entity_id(name, type_)
+            ent = entities.setdefault(
+                entity_id, {"name": name, "type": type_, "aliases": set()}
+            )
+            ent["aliases"].update(m["name"] for m in cluster)
+            vertex_to_entity_id.append(entity_id)
 
-                ent = entities.setdefault(
-                    entity_id,
-                    {"name": canonical_name, "type": entity_type, "aliases": set()},
-                )
-                ent["aliases"].update(names)
-                vertex_to_entity_id.append(entity_id)
+        for label in doc.get("labels", []):
+            h_idx, t_idx = label["h"], label["t"]
+            relation_id = label["r"]
+            evidence_sent_ids, evidence_texts, evidence_source = resolve_evidence(
+                label, mention_sents[h_idx], mention_sents[t_idx], sents
+            )
 
-            for label in doc.get("labels", []):
-                relation_id = label["r"]
-                head_id = vertex_to_entity_id[label["h"]]
-                tail_id = vertex_to_entity_id[label["t"]]
-                key = (head_id, tail_id, relation_id)
-
-                edge = edges.setdefault(
-                    key,
-                    {
-                        "relation_name": rel_info.get(relation_id, relation_id),
-                        "sources": set(),
-                    },
-                )
-                edge["sources"].add(f"{split}::{title}")
+            edges.append(
+                {
+                    "head_id": vertex_to_entity_id[h_idx],
+                    "tail_id": vertex_to_entity_id[t_idx],
+                    "relation_id": relation_id,
+                    "relation_name": rel_info.get(relation_id, relation_id),
+                    "confidence": 1.0,
+                    "split": split,
+                    "document": title,
+                    "sentence_id": evidence_sent_ids,
+                    "evidence": evidence_texts,
+                    "evidence_source": evidence_source,
+                }
+            )
 
     return entities, edges
 
@@ -120,16 +117,9 @@ def to_edge_rows(edges):
     """관계 타입(예: COUNTRY)별로 그룹지어 반환 — Cypher 관계 타입은 파라미터로
     넘길 수 없어 쿼리 문자열에 직접 넣어야 하므로, 타입별로 배치를 나눈다."""
     by_type = {}
-    for (head_id, tail_id, relation_id), edge in edges.items():
+    for edge in edges:
         type_name = relation_type_name(edge["relation_name"])
-        row = {
-            "head_id": head_id,
-            "tail_id": tail_id,
-            "relation_id": relation_id,
-            "relation_name": edge["relation_name"],
-            "sources": sorted(edge["sources"]),
-        }
-        by_type.setdefault(type_name, []).append(row)
+        by_type.setdefault(type_name, []).append(edge)
     return by_type
 
 
@@ -153,20 +143,23 @@ SET e:{type_label}
 
 
 def edge_merge_query(type_name):
+    """document를 MERGE 매칭 키에 포함시켜 문서별로 별도 엣지를 만든다
+    (재실행해도 같은 (head, tail, type, document) 조합은 중복 생성되지 않음)."""
     if not TYPE_NAME_RE.match(type_name):
         raise ValueError(f"안전하지 않은 관계 타입 이름: {type_name!r}")
     return f"""
 UNWIND $rows AS row
 MATCH (h:{ENTITY_LABEL} {{id: row.head_id}})
 MATCH (t:{ENTITY_LABEL} {{id: row.tail_id}})
-MERGE (h)-[r:{type_name}]->(t)
-ON CREATE SET
+MERGE (h)-[r:{type_name} {{document: row.document}}]->(t)
+SET
     r.relation_id = row.relation_id,
     r.relation_name = row.relation_name,
-    r.confidence = 1.0,
-    r.sources = row.sources
-ON MATCH SET
-    r.sources = r.sources + [x IN row.sources WHERE NOT x IN r.sources]
+    r.confidence = row.confidence,
+    r.split = row.split,
+    r.sentence_id = row.sentence_id,
+    r.evidence = row.evidence,
+    r.evidence_source = row.evidence_source
 """
 
 
@@ -198,8 +191,8 @@ def load_into_neo4j(entity_rows_by_type, edge_rows_by_type, batch_size):
             total_entities += len(rows)
         print(f"엔티티 적재 완료: {total_entities}개 ({len(entity_rows_by_type)}개 개체 타입)")
 
-        # 구 스키마(:RELATION 단일 타입)로 적재된 엣지가 남아있으면 제거
-        session.run("MATCH ()-[r:RELATION]->() DELETE r")
+        # 구 스키마(문서 간 병합된 엣지, :RELATION 단일 타입 등)가 남아있으면 전부 제거하고 재적재
+        session.run("MATCH ()-[r]->() DELETE r")
 
         total_edges = 0
         for type_name, rows in edge_rows_by_type.items():
@@ -233,7 +226,7 @@ def main():
     total_edges = sum(len(rows) for rows in edge_rows.values())
     print(f"대상 split: {SPLITS}")
     print(f"고유 개체 수 (전역 병합 후): {total_entities} ({len(entity_rows)}개 개체 타입)")
-    print(f"고유 관계(triple) 수 (전역 병합 후): {total_edges} ({len(edge_rows)}개 관계 타입)")
+    print(f"관계(엣지) 수 (문서별 비병합): {total_edges} ({len(edge_rows)}개 관계 타입)")
 
     if args.dry_run:
         print("--dry-run: Neo4j에 적재하지 않고 종료합니다.")
