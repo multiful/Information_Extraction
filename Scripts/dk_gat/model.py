@@ -97,30 +97,61 @@ class EdgeFeaturedGATLayer(nn.Module):
     """One EGAT layer: multi-head attention over graph neighbors where the
     score also sees the edge embedding -- alpha_ij = softmax_j over
     LeakyReLU(a^T [W h_i || W h_j || e_ij]) -- followed by residual + LayerNorm
-    (+ optional GELU/dropout, layer-1 only per the spec)."""
+    (+ optional GELU/dropout, layer-1 only per the spec).
+
+    use_metapath_attention (off by default): instead of one shared attention
+    vector `a` for every edge, use a separate `a_cat` per edge category
+    (self-loop / entity-entity same-sentence / entity-entity mention-overlap /
+    entity-sentence). With a single shared `a`, edge-type information only
+    reaches the attention score indirectly through e_ij's learned embedding;
+    a per-category `a` lets the model learn a genuinely different scoring
+    function per edge type (e.g. weigh mention-overlap neighbors differently
+    from same-sentence-only ones) instead of one function modulated by an
+    embedding. This is the practical, edge-categorized-graph analogue of
+    meta-path-specific attention in heterogeneous GAT literature (HAN etc.) --
+    there are no actual multi-hop meta-paths here (entity-sentence-entity is
+    already the graph's 2-hop route, handled by stacking 2 GAT layers), so
+    "meta-path" here means per-edge-category, the finest relation-type
+    granularity this graph exposes. Adds (EDGE_CATS - 1) x more `att`
+    parameters (a few thousand floats, negligible next to the encoder) --
+    everything else (proj, edge embeddings themselves) stays shared."""
 
     def __init__(self, dim: int = 768, edge_dim: int = EDGE_EMB_DIM,
-                 num_heads: int = 4, dropout: float = 0.1, final_gelu: bool = True):
+                 num_heads: int = 4, dropout: float = 0.1, final_gelu: bool = True,
+                 use_metapath_attention: bool = False, num_edge_cats: int = 5):
         super().__init__()
         assert dim % num_heads == 0
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.proj = nn.Linear(dim, dim)
-        self.att = nn.Parameter(torch.empty(num_heads, 2 * self.head_dim + edge_dim))
+        self.use_metapath_attention = use_metapath_attention
+        att_shape = ((num_edge_cats, num_heads, 2 * self.head_dim + edge_dim)
+                     if use_metapath_attention
+                     else (num_heads, 2 * self.head_dim + edge_dim))
+        self.att = nn.Parameter(torch.empty(att_shape))
         nn.init.xavier_uniform_(self.att)
         self.leaky = nn.LeakyReLU(0.2)
         self.norm = nn.LayerNorm(dim)
         self.dropout = nn.Dropout(dropout)
         self.final_gelu = final_gelu
 
-    def forward(self, x: torch.Tensor, edge_emb: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
-        # x (N, dim) / edge_emb (N, N, edge_dim) / adj (N, N) bool (self-loops included)
+    def forward(self, x: torch.Tensor, edge_emb: torch.Tensor, adj: torch.Tensor,
+                edge_cat_idx: torch.Tensor = None) -> torch.Tensor:
+        # x (N, dim) / edge_emb (N, N, edge_dim) / adj (N, N) bool (self-loops
+        # included) / edge_cat_idx (N, N) long -- raw edge-category id per
+        # pair, only needed (and required) when use_metapath_attention is on.
         n = x.size(0)
         h = self.proj(x).view(n, self.num_heads, self.head_dim)
         hi = h.unsqueeze(1).expand(n, n, self.num_heads, self.head_dim)
         hj = h.unsqueeze(0).expand(n, n, self.num_heads, self.head_dim)
         e = edge_emb.unsqueeze(2).expand(n, n, self.num_heads, edge_emb.size(-1))
-        scores = self.leaky((torch.cat([hi, hj, e], dim=-1) * self.att).sum(-1))  # (N, N, H)
+        cat_vec = torch.cat([hi, hj, e], dim=-1)  # (N, N, H, 2*head_dim+edge_dim)
+        if self.use_metapath_attention:
+            assert edge_cat_idx is not None, "use_metapath_attention needs edge_cat_idx"
+            att_sel = self.att[edge_cat_idx]  # (N, N, H, feat) -- per-pair attention vector
+            scores = self.leaky((cat_vec * att_sel).sum(-1))  # (N, N, H)
+        else:
+            scores = self.leaky((cat_vec * self.att).sum(-1))  # (N, N, H)
         scores = scores.masked_fill(~adj.unsqueeze(-1), -1e30)
         alpha = self.dropout(torch.softmax(scores, dim=1))
         out = torch.einsum("ijh,jhd->ihd", alpha, h).reshape(n, -1)
@@ -135,7 +166,8 @@ class DocREGATModel(nn.Module):
                  dropout: float = 0.1, evidence_weight: float = 0.2,
                  evidence_tau: float = 0.1, offset: int = 1, loss_fnt: nn.Module = None,
                  use_jk: bool = True, use_gated_fusion: bool = False,
-                 use_bilinear_classifier: bool = False, use_abs_diff: bool = False):
+                 use_bilinear_classifier: bool = False, use_abs_diff: bool = False,
+                 use_metapath_attention: bool = False):
         super().__init__()
         self.config = config
         self.encoder = encoder
@@ -177,6 +209,12 @@ class DocREGATModel(nn.Module):
         # in context). Ignored when use_bilinear_classifier is on (that path doesn't
         # use the concat pair_proj at all). Off by default -- A/B test first.
         self.use_abs_diff = use_abs_diff
+        # Meta-path attention: per-edge-category attention vector instead of one
+        # shared vector for every edge -- see EdgeFeaturedGATLayer's docstring for
+        # the full rationale/interpretation. Off by default -- unlike gated_fusion/
+        # bilinear_classifier/abs_diff above, this has NOT been distant-screened yet
+        # (new this session); treat as unvalidated until an A/B run confirms it.
+        self.use_metapath_attention = use_metapath_attention
         if use_bilinear_classifier:
             self.emb_size = hidden
             self.block_size = 64
@@ -191,8 +229,10 @@ class DocREGATModel(nn.Module):
         self.dist_emb = nn.Embedding(NUM_DIST_BUCKETS, 8)
         self.type_emb = nn.Embedding(NUM_ENTITY_TYPES, 8)
 
-        self.gat1 = EdgeFeaturedGATLayer(hidden, EDGE_EMB_DIM, num_heads, dropout, final_gelu=True)
-        self.gat2 = EdgeFeaturedGATLayer(hidden, EDGE_EMB_DIM, num_heads, dropout, final_gelu=False)
+        self.gat1 = EdgeFeaturedGATLayer(hidden, EDGE_EMB_DIM, num_heads, dropout, final_gelu=True,
+                                          use_metapath_attention=use_metapath_attention)
+        self.gat2 = EdgeFeaturedGATLayer(hidden, EDGE_EMB_DIM, num_heads, dropout, final_gelu=False,
+                                          use_metapath_attention=use_metapath_attention)
 
         # [g_h ; g_t ; g_h*g_t ; c_ht] -> MLP path -- only built when NOT using the
         # bilinear classifier (mutually exclusive, see use_bilinear_classifier
@@ -313,6 +353,8 @@ class DocREGATModel(nn.Module):
 
             edge_emb = self._edge_embeddings(f["edge_cat"], f["edge_dist"], f["entity_types"], device)
             adj = torch.as_tensor(f["adj"], dtype=torch.bool, device=device)
+            edge_cat_idx = (torch.as_tensor(f["edge_cat"], dtype=torch.long, device=device)
+                            if self.use_metapath_attention else None)
             # Jump Knowledge: element-wise max over {input, layer-1, layer-2} instead of
             # only using the last layer's output. Each GAT layer already has its own
             # residual (x + out), so some "jumping" happens internally, but that only
@@ -324,8 +366,8 @@ class DocREGATModel(nn.Module):
             # already increasing parameter count on a fixed 3,053-doc annotated set,
             # this keeps the "did it help" signal attributable to the JK idea itself
             # rather than to extra capacity.
-            h1 = self.gat1(node_emb, edge_emb, adj)
-            h2 = self.gat2(h1, edge_emb, adj)
+            h1 = self.gat1(node_emb, edge_emb, adj, edge_cat_idx=edge_cat_idx)
+            h2 = self.gat2(h1, edge_emb, adj, edge_cat_idx=edge_cat_idx)
             if self.use_gated_fusion:
                 # Learned per-dimension gate between the original entity embedding and
                 # the GAT-refined one -- entity rows only (sentence nodes have no
