@@ -18,7 +18,6 @@ added; the model adds a `+offset` (1 for the leading [CLS]) when indexing.
 
 import sys
 from pathlib import Path
-from typing import Optional
 
 from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
@@ -39,9 +38,7 @@ def _encode_with_markers(doc: dict, tokenizer: PreTrainedTokenizerBase):
     (start, end) subword spans (start = the `*` start-marker index), one per
     mention, in vertexSet order, and sent_pos[sid] is the (start, end) subword
     span of sentence `sid` (marker tokens included, same coordinate system as
-    entity_pos; used to aggregate token-level attention into per-sentence mass
-    for both the DREEAM evidence-guided attention loss and GREP's evidence
-    module). Positions exclude the [CLS]/[SEP] added at the end (the model
+    entity_pos). Positions exclude the [CLS]/[SEP] added at the end (the model
     compensates with +offset).
     """
     sents = doc["sents"]
@@ -98,7 +95,7 @@ def _encode_with_markers(doc: dict, tokenizer: PreTrainedTokenizerBase):
 def build_features(
     docs,
     tokenizer: PreTrainedTokenizerBase,
-    rel2id: Optional[dict] = None,  # dict[str, int]; Optional for Python 3.9 (X | None is 3.10+)
+    rel2id: dict[str, int] | None = None,
     show_progress: bool = True,
 ) -> list[dict]:
     """Turn an iterable of raw DocRED docs into ATLOP feature dicts.
@@ -106,7 +103,6 @@ def build_features(
     Each feature:
       input_ids   : list[int]  (with [CLS]/[SEP], `*` markers inserted)
       entity_pos  : list[list[(start, end)]]  marker-based spans per mention
-      sent_pos    : list[(start, end)]        marker-based span per sentence
       hts         : list[(h, t)]              every ordered entity pair, h != t
       labels      : list[list[int]]           per pair, the positive class ids
                                               (Na pairs -> [0]); the collate_fn
@@ -114,21 +110,21 @@ def build_features(
                                               multi-hot tensor. Stored sparsely
                                               so train_distant (100k docs) fits
                                               in memory.
-      evidence    : list[list[int]]           per pair, gold evidence sentence
-                                              ids (union across relations on
-                                              that pair; [] if none — always []
-                                              on train_distant, which carries no
-                                              evidence). Used by the DREEAM
-                                              evidence-guided attention loss and
-                                              GREP's evidence module; ignored by
-                                              plain ATLOP.
       title       : str
       num_entities: int
+      sent_pos    : list[(start, end)]        subword span per sentence (same
+                                              coordinate system as entity_pos);
+                                              used by GREP's evidence module,
+                                              ignored by the ATLOP pipeline
+      evidence    : list[list[int]]           per pair (hts order), the union
+                                              of gold evidence sentence ids
+                                              across that pair's relation
+                                              labels (Na pairs -> []); used by
+                                              GREP, ignored by ATLOP
       doc_rel_labels: list[int]               sorted positive relation ids
-                                              present anywhere in the doc; used
-                                              by GREP's Global Relation
-                                              Prediction module, ignored
-                                              otherwise
+                                              present anywhere in the doc;
+                                              used by GREP's Global Relation
+                                              Prediction module, ignored by ATLOP
     """
     if rel2id is None:
         rel2id = build_rel2id()
@@ -139,13 +135,13 @@ def build_features(
         input_ids, entity_pos, sent_pos = _encode_with_markers(doc, tokenizer)
         n_ent = len(doc["vertexSet"])
 
-        # gold relations + evidence sentences keyed by (head_idx, tail_idx)
+        # gold relations + evidence sentences, keyed by (head_idx, tail_idx)
         triples: dict[tuple[int, int], list[int]] = {}
-        pair_evidence: dict[tuple[int, int], set[int]] = {}
+        triple_evidence: dict[tuple[int, int], set[int]] = {}
         for label in doc.get("labels", []):
             key = (label["h"], label["t"])
             triples.setdefault(key, []).append(rel2id[label["r"]])
-            pair_evidence.setdefault(key, set()).update(label.get("evidence", []))
+            triple_evidence.setdefault(key, set()).update(label.get("evidence", []))
 
         hts, labels, evidence = [], [], []
         for h in range(n_ent):
@@ -158,7 +154,7 @@ def build_features(
                     pos = [0]  # Na / TH
                 hts.append((h, t))
                 labels.append(pos)
-                evidence.append(sorted(pair_evidence.get((h, t), ())))
+                evidence.append(sorted(triple_evidence.get((h, t), set())))
 
         doc_rel_labels = sorted({r for ids in triples.values() for r in ids})
 
@@ -166,12 +162,12 @@ def build_features(
             {
                 "input_ids": input_ids,
                 "entity_pos": entity_pos,
-                "sent_pos": sent_pos,
                 "hts": hts,
                 "labels": labels,
-                "evidence": evidence,
                 "title": doc["title"],
                 "num_entities": n_ent,
+                "sent_pos": sent_pos,
+                "evidence": evidence,
                 "doc_rel_labels": doc_rel_labels,
             }
         )
