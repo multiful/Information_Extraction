@@ -1,7 +1,16 @@
 # dk EGAT 모델 — 제안 아키텍처 파이프라인 문서
 
-> **최종 업데이트**: 2026-07-14 (Gated Fusion / Bilinear Classifier / abs-diff 구현 + 학습 전략
-> 플래그 추가, 전부 토글식 — A/B 검증 전까지 기본값은 변경 없음):
+> **최종 업데이트**: 2026-07-14 (예전 실행 결과 뒤늦게 발견 + 기록): `colab_gat_a100.ipynb` 셀
+> 4의 예전 출력(Heterogeneous graph + interaction term, JK/Gated Fusion/Bilinear 없음)이 실은
+> 이미 15 epoch 전부 완료돼 있었음 — **dev F1 60.27(final epoch)/60.29(best epoch 13), Ign F1
+> 58.41/58.39로 baseline(61.71/59.86)보다 낮음**. Gated Fusion(+2.2 F1)·Bilinear
+> Classifier(+3.67 F1) 스크리닝 결과가 이 60.29를 baseline 이상으로 끌어올릴 걸로 기대되지만,
+> **`results/comparison.md`에 이미 기록된 선례**(PU loss가 distant-only 스크리닝에서 +2.93 F1이었다가
+> 실제 파인튜닝 후엔 +0.35로 줄어든 사례)를 감안하면 스크리닝 이득이 그대로 다 전이된다는 보장은
+> 없음 — 다음 전체 실행(Gated Fusion+Bilinear 반영)이 실제 확인 수단.
+>
+> 이전 (Gated Fusion / Bilinear Classifier / abs-diff 구현 + 학습 전략 플래그 추가, 전부 토글식
+> — A/B 검증 전까지 기본값은 변경 없음):
 >
 > **✅ Gated Fusion A/B 결론 (distant 3,000문서 스크리닝, 2026-07-14 15:29 완료) — 채택 확정**:
 >
