@@ -5,10 +5,10 @@ baseline 학습 스크립트(train_re.py)는 무수정. 그 헬퍼(set_seed / bu
 forward 시그니처가 sent_pos·evidence를 추가로 받으므로 collate / predict /
 run_stage를 여기서 다시 정의한다 (train_graph.py와 같은 이유).
 
-기본값이 PNG 파이프라인에 맞춰져 있다:
-  --model_name_or_path roberta-base   (RoBERTa Encoder)
+기본값이 이미지 파이프라인에 맞춰져 있다:
+  --model_name_or_path bert-base-cased  (BERT-base Encoder)
   --use_pu_loss (기본 켜짐) --na_weight 0.7   (TTM-RE PU, w=0.7 — distant 단계만)
-  --evi_lambda 0.1                      (DREEAM evidence 지도학습 가중치)
+  --evi_lambda 0.1                      (evidence contrastive loss 가중치)
 
 PU는 distant 사전학습 단계에만 적용된다(annotated의 Na는 gold이므로 fine-tune은
 표준 ATLoss). evidence loss는 evidence가 있는 pair에서만 계산되므로 distant
@@ -103,12 +103,12 @@ def predict(model, loader, id2rel, device) -> list[dict]:
 
 
 def build_optim_sched(model, args, total_steps):
-    # freshly-initialized layers (incl. graph + evidence gate) get classifier LR
-    new_layers = ("extractor", "bilinear", "graph", "evi_gate")
+    # encoder gets the smaller encoder LR; every freshly-initialized head / graph
+    # / fusion / classifier param gets the classifier LR.
     grouped = [
-        {"params": [p for n, p in model.named_parameters() if not any(k in n for k in new_layers)],
+        {"params": [p for n, p in model.named_parameters() if n.startswith("encoder.")],
          "lr": args.encoder_lr},
-        {"params": [p for n, p in model.named_parameters() if any(k in n for k in new_layers)],
+        {"params": [p for n, p in model.named_parameters() if not n.startswith("encoder.")],
          "lr": args.classifier_lr},
     ]
     optimizer = torch.optim.AdamW(grouped, eps=1e-6)
@@ -156,7 +156,7 @@ def run_stage(model, loader, args, device, epochs, stage, dev_loader, dev_docs,
 def train(args):
     set_seed(args.seed)
     device = torch.device(args.device)
-    print(f"[device] {device}  [model] full (DREEAM-LCP + GREP-GAT + PU)")
+    print(f"[device] {device}  [model] full (BERT node-GAT + DREAM evidence + gated MLP)")
 
     if args.run_name == "atlop":
         args.run_name = "atlop_full"
@@ -192,7 +192,7 @@ def train(args):
                            block_size=args.block_size, num_labels=NUM_CLASSES,
                            graph_layers=args.graph_layers, graph_dim=args.graph_dim,
                            graph_heads=args.graph_heads, graph_dropout=args.graph_dropout,
-                           evi_lambda=args.evi_lambda).to(device)
+                           evi_lambda=args.evi_lambda, mlp_dropout=args.mlp_dropout).to(device)
 
     if args.init_ckpt:
         state = torch.load(args.init_ckpt, map_location="cpu")
@@ -253,16 +253,18 @@ def train(args):
 
 def build_full_argparser():
     p = build_argparser()
-    p.description = "Integrated DocRE model (DREEAM-LCP + GREP-GAT + PU ATLoss) on DocRED"
-    p.add_argument("--graph_layers", type=int, default=2, help="pair-graph propagation layers")
-    p.add_argument("--graph_dim", type=int, default=256, help="pair-graph node feature dim")
+    p.description = "Integrated DocRE model (BERT node-GAT + DREAM evidence + gated MLP) on DocRED"
+    p.add_argument("--graph_layers", type=int, default=2, help="heterogeneous node-GAT layers")
+    p.add_argument("--graph_dim", type=int, default=256,
+                   help="node (mention/entity/sentence) feature dim")
     p.add_argument("--graph_heads", type=int, default=4, help="GAT attention heads")
     p.add_argument("--graph_dropout", type=float, default=0.1)
+    p.add_argument("--mlp_dropout", type=float, default=0.2, help="classifier MLP dropout")
     p.add_argument("--evi_lambda", type=float, default=0.1,
-                   help="weight of the DREEAM evidence-supervision loss (0 disables it)")
+                   help="weight of the evidence contrastive loss (0 disables it)")
     p.add_argument("--init_ckpt", default="", help="warm-start state_dict (strict=False)")
-    # PNG 파이프라인 기본값: RoBERTa 인코더 + PU(w=0.7) 켜짐
-    p.set_defaults(model_name_or_path="roberta-base", use_pu_loss=True, na_weight=0.7)
+    # 이미지 파이프라인 기본값: BERT-base 인코더 + PU(w=0.7, distant 단계만) 켜짐
+    p.set_defaults(model_name_or_path="bert-base-cased", use_pu_loss=True, na_weight=0.7)
     return p
 
 

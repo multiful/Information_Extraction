@@ -1,6 +1,8 @@
 # ATLOP baseline (PRD 트랙 2)
 
-> **최종 업데이트**: 2026-07-13: 개선 모델 2종 추가 — 개선 1 `re_model_gcn.py`(GREP: Entity Pair Graph + relational GCN), 개선 2 `re_model_gat.py`(LCP + Entity Pair Graph + GAT). baseline 파일(`re_model.py`/`train_re.py`)은 무수정 유지, 학습은 별도 진입점 `train_graph.py`(`--model gcn|gat`, `--init_ckpt`로 baseline warm-start 지원). CPU 검증은 `smoke_test_graph.py`.
+> **최종 업데이트**: 2026-07-14: 통합 모델(`DocREModelFull`)을 이미지 파이프라인으로 재구축 — BERT-base + Entity/Mention/Sentence 이종 그래프 GAT ∥ DREAM 증거 분기 → gated fusion → 2-layer MLP, AT-Loss + evidence contrastive(multi-positive InfoNCE). `graph_layers.py`에 `HeteroGATLayer` 추가, `train_full.py` 기본 인코더 bert-base-cased, CPU 스모크 통과.
+>
+> 2026-07-13: 개선 모델 2종 추가 — 개선 1 `re_model_gcn.py`(GREP: Entity Pair Graph + relational GCN), 개선 2 `re_model_gat.py`(LCP + Entity Pair Graph + GAT). baseline 파일(`re_model.py`/`train_re.py`)은 무수정 유지, 학습은 별도 진입점 `train_graph.py`(`--model gcn|gat`, `--init_ckpt`로 baseline warm-start 지원). CPU 검증은 `smoke_test_graph.py`.
 >
 > 2026-07-12: 학습 순서를 원 논문 방식으로 전환 — `--distant_mode` 옵션 추가. 기본값 `pretrain`(① `train_distant` 사전학습 ② `train_annotated` fine-tune ③ `dev` 평가, ATLOP 원 논문 순서). 기존 팀 레시피(annotated 학습 → teacher denoise → distant 학습)는 `--distant_mode denoise`로 유지, `--distant_mode none`은 annotated 단독.
 >
@@ -77,44 +79,50 @@ python -m Scripts.atlop.train_graph --model gat --init_ckpt results/atlop.pt --d
 
 개선 여부 확인: ① 학습 로그의 dev F1/Ign F1을 baseline(61.71/59.86)과 비교(시드 ±1점 감안, `results/comparison.md`에 기록), ② `model.ipynb`의 "개선 모델 검증" 셀에서 테스트 1(multi-hop) 재실행 — (0,2) 조합 관계 검출 여부.
 
-## 통합 모델 (세 개선을 하나로 — baseline 파일 무수정)
+## 통합 모델 (이미지 파이프라인 재구축 — baseline 파일 무수정)
 
-세 문제(① multi-hop ② low-attention 정보 유실 ③ 임계값 고도화)를 한 파이프라인에 결합. baseline `re_model.py`를 상속하고, DREEAM evidence-guided context·GREP GAT·PU ATLoss만 얹는다.
+세 문제(① multi-hop ② 정보 유실 ③ 임계값)를 **이미지 아키텍처**로 재설계해 한 파이프라인에 결합. baseline `re_model.py`는 무수정(=`process_long_input`/`ATLoss`만 import 재사용), 인코더는 `encoder.*` 키를 그대로 써 baseline 체크포인트로 warm-start 가능.
 
 ```text
-Document → RoBERTa Encoder → Entity Marker + logsumexp Pooling
-  → Evidence-guided Local Context (DREEAM 아이디어)   … 문제 ②
-  → Entity Pair Representation
-  → Entity Pair Graph + GAT (GREP 아이디어)           … 문제 ①
-  → Relation Classifier
-  → PU-inspired ATLoss (TTM-RE, w=0.7, distant 단계)  … 문제 ③
+Input Document → BERT-base Encoder
+  ├─ GAT (Node-level): Entity/Mention/Sentence 이종 그래프, 구조적 이웃 통합   … 문제 ①
+  │    → ATLOP Localized Context (GAT 강화 엔티티) → Entity Pair h(i,j)_GAT
+  └─ DREAM (Doc-level): 문장 reasoning + 증거 문장 탐색(Evidence)              … 문제 ②
+  → Attention/Gated Fusion (구조 ⊕ 증거)
+  → 2-Layer MLP Classifier
+  → AT-Loss + λ·Evidence Contrastive Loss                                     … 문제 ③(PU, distant 단계)
   → Relation Triples (h, r, t)
 ```
 
 | 파일 | 역할 |
 |---|---|
-| `re_model_full.py` `DocREModelFull` | 통합 모델. ① evidence-guided context(학습형 게이트 g로 product attention q_prod에 evidence 분포 q_evi를 섞어 근거 토큰 유실 방지 + gold evidence 지도학습) ② GREP entity-pair graph + GAT(zero-init 잔차) ③ 손실은 주입된 loss_fnt(distant=PUATLoss(0.7), annotated=ATLoss) + `evi_lambda`×evidence loss |
-| `preprocess_full.py` | `build_features_full` — baseline 전처리의 superset. `sent_pos`(문장 토큰 span)·`evidence`(pair별 gold 근거 문장) 추가 |
-| `train_full.py` | 통합 모델 전용 학습 진입점. 기본값 `roberta-base` + `--use_pu_loss`(켜짐)·`--na_weight 0.7` + `--evi_lambda 0.1`. `train_re.py` 헬퍼 재사용 |
-| `smoke_test_full.py` | CPU 정합성 검증: evidence 분포 합=1, forward/backward 전 파라미터 grad, evidence 항 기여 확인 |
+| `re_model_full.py` `DocREModelFull` | 재구축 통합 모델. ① Mention/Entity/Sentence 이종 그래프 + 6종 타입 엣지(mention–entity/–sentence, entity–sentence, sentence–sentence 인접, mention–mention coref/공기)를 `HeteroGATLayer`로 전파 ② GAT 강화 엔티티로 ATLOP LCP → 쌍 표현 h(i,j)_GAT ③ 문장 self-attention(DREAM) + 쌍-문장 attention으로 증거 분포·증거 문맥 ④ 게이트 융합 → 2-layer MLP ⑤ 손실 = 주입 loss_fnt(distant=PUATLoss(0.7)/annotated=ATLoss) + `evi_lambda`×evidence contrastive(multi-positive InfoNCE) |
+| `graph_layers.py` `HeteroGATLayer` | 이종 노드 그래프용 multi-head GAT(타입별 (엣지,head) bias). 기존 pair 레이어(개선 1·2)는 그대로 |
+| `preprocess_full.py` | `build_features_full` — baseline 전처리의 superset. `sent_pos`(문장 토큰 span)·`evidence`(pair별 gold 근거 문장). **전처리 변경 없이** 이종 그래프 구성 재료로 사용 |
+| `train_full.py` | 통합 모델 전용 학습 진입점. 기본값 `bert-base-cased` + `--use_pu_loss`(켜짐)·`--na_weight 0.7` + `--evi_lambda 0.1`·`--mlp_dropout 0.2`. `train_re.py` 헬퍼 재사용 |
+| `smoke_test_full.py` | CPU 정합성 검증: 이종 그래프(노드 수·타입 엣지·대칭·self-loop 없음), forward/backward 전 파라미터 grad, evidence contrastive 항 기여 |
 
 설계 포인트:
-- **evidence 지도학습은 annotated에만 적용** — train_distant는 evidence가 비어 있어(실측 확인) evidence loss가 자동으로 0. DREEAM이 사람 근거를 쓰는 방식과 일치.
+- **관계 연결성**: 한 엔티티의 흩어진 멘션이 coref/문장 노드를 거쳐 서로를 읽어, ATLOP이 독립 분류하던 (h,t) 쌍이 문서 구조(multi-hop·상호참조)를 반영한다.
+- **evidence contrastive는 annotated에만** — train_distant는 evidence가 비어 있어 항이 자동으로 0(gold evidence 문장을 양성으로 한 multi-positive InfoNCE로 DREAM 분기가 근거 문장에 집중하도록 지도).
 - **PU(w=0.7)는 distant 단계에만** — annotated의 Na는 gold이므로 fine-tune은 표준 ATLoss. `PUATLoss = loss1 + w·loss2`(w=`na_weight`).
-- evidence 게이트 `evi_gate`는 sigmoid로 g를 만들며 init −2.0(g≈0.12)이라 시작 시 거의 순수 product context(≈baseline)에서 출발해 evidence 질량을 얼마나 더할지 학습.
+- **인코더 warm-start**: `--init_ckpt results/atlop.pt`로 BERT 인코더 가중치를 baseline에서 가져올 수 있다(그래프·융합·MLP 헤드는 새로 학습). 분류기를 bilinear→MLP로 교체했으므로 "출력 완전 동일" parity는 없다.
 
 ```bash
 # CPU 정합성 검증
 python -m Scripts.atlop.smoke_test_full
 
-# 풀 학습 (Colab A100, baseline과 동일 레시피 — RoBERTa 인코더)
+# 풀 학습 (Colab A100, baseline과 동일 레시피 — BERT-base 인코더)
 python -m Scripts.atlop.train_full --epochs 15 --distant_limit 20000 --distant_epochs 1 --eval_batch_size 32 --save_model
 # -> results/atlop_full.pt
 
-# ablation 예: PU 끄기(--na_weight 1.0), evidence 끄기(--evi_lambda 0), 인코더 교체(--model_name_or_path bert-base-cased)
+# (권장) baseline BERT 인코더 warm-start — recall 회복·수렴 안정
+python -m Scripts.atlop.train_full --epochs 15 --distant_limit 20000 --distant_epochs 1 --eval_batch_size 32 --init_ckpt results/atlop.pt --save_model
+
+# ablation 예: bilinear 상호작용 끄기(--no_bilinear), 융합 방식(--fusion gate), PU 끄기(--na_weight 1.0), evidence 끄기(--evi_lambda 0), 그래프 층수(--graph_layers), 인코더 교체(--model_name_or_path roberta-base)
 ```
 
-주의: RoBERTa는 BERT와 인코더가 달라(mention pooling 계열 트랙1과도 다름) baseline(BERT) 대비 F1 차이가 인코더 효과와 섞인다 — 순수 구조 효과를 보려면 `--model_name_or_path bert-base-cased`로도 한 번 돌려 비교 권장.
+분류기 헤드(기본값): **2-layer MLP(융합 벡터) + grouped-bilinear head×tail 상호작용 잔차**(`--no_bilinear`로 제거). 융합은 **residual**(구조 신호 z_struct 우세, 게이트 init −2.0으로 증거는 열리는 만큼만 더함; `--fusion gate`로 convex 혼합). 초기 MLP-단독/convex 버전이 baseline과 동률·recall 손실이라, ATLOP 곱 신호를 되살리고 강한 쌍 신호를 보존하도록 보강한 것.
 
 ## 실행법
 
