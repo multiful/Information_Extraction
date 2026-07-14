@@ -25,6 +25,13 @@ folder for the full pipeline doc and the interpretation decisions):
                (e.g. Steve Jobs -[S1]- Apple -[S2]- California), which an
                entity-only graph couldn't do without a direct or same-type
                edge between them.
+  Jump         element-wise MAX over {input embedding, layer-1 output,
+  Knowledge    layer-2 output} instead of only using the last layer -- lets
+               the classifier draw on 0/1/2-hop information per node rather
+               than a fixed blend. Adds zero new parameters (deliberately --
+               see forward()'s comment for why, given everything else added
+               the same day already grew parameter count on a fixed-size
+               annotated set).
   pair context ATLOP Localized Context Pooling from last-layer attention (768)
   pair repr    Linear([g_h ; g_t ; g_h*g_t ; c_ht], 3072 -> 768) -- the added
                element-wise product term lets the classifier see multiplicative
@@ -32,7 +39,13 @@ folder for the full pipeline doc and the interpretation decisions):
                concatenation (standard relation-classification trick, akin to
                the bilinear/DistMult-style interaction ATLOP's own grouped
                bilinear classifier uses, but explicit here as a single term
-               instead of a block-bilinear expansion).
+               instead of a block-bilinear expansion). Optional (use_abs_diff,
+               off by default): also append |g_h - g_t| (InferSent-style) --
+               a magnitude-of-disagreement signal the product term doesn't
+               capture. Both this and use_bilinear_classifier are alternative/
+               additional ways of enriching the pair representation; only used
+               when use_bilinear_classifier is off (that path bypasses pair_proj
+               entirely).
   classifier   LayerNorm -> Linear(768,768) -> GELU -> Dropout -> Linear(768,97)
   loss         Adaptive Thresholding (class 0 = learned TH/Na, see
                Scripts/atlop/losses.py) -- train_gat.py injects PUATLoss
@@ -120,7 +133,9 @@ class EdgeFeaturedGATLayer(nn.Module):
 class DocREGATModel(nn.Module):
     def __init__(self, config, encoder, num_labels: int = 97, num_heads: int = 4,
                  dropout: float = 0.1, evidence_weight: float = 0.2,
-                 evidence_tau: float = 0.1, offset: int = 1, loss_fnt: nn.Module = None):
+                 evidence_tau: float = 0.1, offset: int = 1, loss_fnt: nn.Module = None,
+                 use_jk: bool = True, use_gated_fusion: bool = False,
+                 use_bilinear_classifier: bool = False, use_abs_diff: bool = False):
         super().__init__()
         self.config = config
         self.encoder = encoder
@@ -129,6 +144,48 @@ class DocREGATModel(nn.Module):
         self.num_labels = num_labels
         self.evidence_weight = evidence_weight
         self.evidence_tau = evidence_tau
+        # Jump Knowledge on/off -- kept toggleable (not just documented) so it can be
+        # A/B tested on CPU before being trusted as the pushed default, per the
+        # project's "one variable at a time, validate before keeping" convention.
+        self.use_jk = use_jk
+        # Gated Fusion: learned per-dimension gate blending the GAT-refined entity
+        # embedding with the original (pre-GAT) BERT entity embedding, instead of
+        # JK's parameter-free max. Motivation: GAT message-passing can dilute a
+        # strong entity representation by averaging it with less-informative
+        # neighbors (e.g. "Obama" pulled toward "Apple"/"Company"/a sentence node);
+        # a learned gate lets the model decide, per entity, how much to trust the
+        # graph-refined signal vs. fall back to BERT's own representation, rather
+        # than a fixed element-wise max or residual ratio. Takes priority over
+        # use_jk when both would apply (see forward()) -- it's meant to supersede
+        # JK's combination step, not stack with it, since both address the same
+        # "how much of the original embedding to keep" question. Off by default
+        # until A/B tested against the current use_jk=True default.
+        self.use_gated_fusion = use_gated_fusion
+        # ATLOP-style grouped bilinear classifier, as an alternative to the
+        # concat+interaction+MLP pair representation below. Motivation: training
+        # curves look healthy (steady loss decrease, no instability), so the gap
+        # vs baseline may be a classifier-capacity bottleneck rather than a GAT/
+        # graph problem -- ATLOP's grouped bilinear captures many more head/tail
+        # cross-terms (block-wise outer products) than a single elementwise
+        # g_h*g_t term. Supersedes (not stacks with) the interaction term, since
+        # both serve the same "capture multiplicative interactions" purpose.
+        self.use_bilinear_classifier = use_bilinear_classifier
+        # abs(g_h - g_t): standard InferSent-style interaction term alongside the
+        # existing g_h*g_t product. Product captures "both large/both small";
+        # abs-diff captures magnitude of disagreement between head/tail features --
+        # a different signal (e.g. two entities of very different "size"/salience
+        # in context). Ignored when use_bilinear_classifier is on (that path doesn't
+        # use the concat pair_proj at all). Off by default -- A/B test first.
+        self.use_abs_diff = use_abs_diff
+        if use_bilinear_classifier:
+            self.emb_size = hidden
+            self.block_size = 64
+            assert self.emb_size % self.block_size == 0
+            self.head_extractor = nn.Linear(hidden * 2, self.emb_size)
+            self.tail_extractor = nn.Linear(hidden * 2, self.emb_size)
+            self.bilinear = nn.Linear(self.emb_size * self.block_size, num_labels)
+        if use_gated_fusion:
+            self.gate_proj = nn.Linear(hidden * 2, hidden)
 
         self.cat_emb = nn.Embedding(EDGE_CATS, 8)
         self.dist_emb = nn.Embedding(NUM_DIST_BUCKETS, 8)
@@ -137,15 +194,19 @@ class DocREGATModel(nn.Module):
         self.gat1 = EdgeFeaturedGATLayer(hidden, EDGE_EMB_DIM, num_heads, dropout, final_gelu=True)
         self.gat2 = EdgeFeaturedGATLayer(hidden, EDGE_EMB_DIM, num_heads, dropout, final_gelu=False)
 
-        # [g_h ; g_t ; g_h*g_t ; c_ht] -- interaction term added, see module docstring
-        self.pair_proj = nn.Linear(hidden * 4, hidden)
-        self.classifier = nn.Sequential(
-            nn.LayerNorm(hidden),
-            nn.Linear(hidden, hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, num_labels),
-        )
+        # [g_h ; g_t ; g_h*g_t ; c_ht] -> MLP path -- only built when NOT using the
+        # bilinear classifier (mutually exclusive, see use_bilinear_classifier
+        # above; no dead/unused params either way).
+        if not use_bilinear_classifier:
+            pair_dim = hidden * (5 if use_abs_diff else 4)
+            self.pair_proj = nn.Linear(pair_dim, hidden)
+            self.classifier = nn.Sequential(
+                nn.LayerNorm(hidden),
+                nn.Linear(hidden, hidden),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden, num_labels),
+            )
         # Adaptive Thresholding (ATLoss / PUATLoss), injected so train_gat can swap in
         # PUATLoss(na_weight=0.7) for the distant stage and plain ATLoss for annotated
         # fine-tune, exactly like Scripts/atlop/train_re.py -- NOT BCEWithLogitsLoss.
@@ -252,8 +313,33 @@ class DocREGATModel(nn.Module):
 
             edge_emb = self._edge_embeddings(f["edge_cat"], f["edge_dist"], f["entity_types"], device)
             adj = torch.as_tensor(f["adj"], dtype=torch.bool, device=device)
-            g_all = self.gat2(self.gat1(node_emb, edge_emb, adj), edge_emb, adj)  # (n_ent+n_sent, H)
-            g = g_all[:n_ent]  # sentence nodes only mediate message passing, drop them here
+            # Jump Knowledge: element-wise max over {input, layer-1, layer-2} instead of
+            # only using the last layer's output. Each GAT layer already has its own
+            # residual (x + out), so some "jumping" happens internally, but that only
+            # gives a fixed blend of the previous layer into the next -- JK gives the
+            # classifier direct, unmixed access to each hop's own representation so it
+            # can lean on 0/1/2-hop information per-node rather than a fixed ratio.
+            # Max (not concat+Linear) deliberately adds zero new parameters -- with the
+            # heterogeneous graph and the pair interaction term added earlier today
+            # already increasing parameter count on a fixed 3,053-doc annotated set,
+            # this keeps the "did it help" signal attributable to the JK idea itself
+            # rather than to extra capacity.
+            h1 = self.gat1(node_emb, edge_emb, adj)
+            h2 = self.gat2(h1, edge_emb, adj)
+            if self.use_gated_fusion:
+                # Learned per-dimension gate between the original entity embedding and
+                # the GAT-refined one -- entity rows only (sentence nodes have no
+                # "original identity" worth preserving this way, they're just
+                # message-passing scaffolding). Supersedes JK's combination step.
+                ent_orig = node_emb[:n_ent]
+                ent_gat = h2[:n_ent]
+                gate = torch.sigmoid(self.gate_proj(torch.cat([ent_orig, ent_gat], dim=-1)))
+                g = gate * ent_gat + (1 - gate) * ent_orig
+            elif self.use_jk:
+                g_all = torch.stack([node_emb, h1, h2], dim=0).max(dim=0).values  # (n_ent+n_sent, H)
+                g = g_all[:n_ent]  # sentence nodes only mediate message passing, drop them here
+            else:
+                g = h2[:n_ent]  # pre-JK behavior: last GAT layer output only
 
             ht = torch.as_tensor(f["hts"], dtype=torch.long, device=device).reshape(-1, 2)
             h_att = ent_att[ht[:, 0]]
@@ -263,8 +349,24 @@ class DocREGATModel(nn.Module):
             context = joint @ seq_i  # (P, H) Localized Context Pooling
 
             g_h, g_t = g[ht[:, 0]], g[ht[:, 1]]
-            pair = torch.cat([g_h, g_t, g_h * g_t, context], dim=-1)  # (P, 4H)
-            logits = self.classifier(self.pair_proj(pair))
+            if self.use_bilinear_classifier:
+                # ATLOP-style grouped bilinear: head/tail each get their own
+                # [entity; context] projection, then a block-wise outer product
+                # captures many more cross-terms than a single g_h*g_t. Replaces
+                # the interaction term entirely (see __init__ comment).
+                hs = torch.tanh(self.head_extractor(torch.cat([g_h, context], dim=-1)))
+                ts = torch.tanh(self.tail_extractor(torch.cat([g_t, context], dim=-1)))
+                b1 = hs.view(-1, self.emb_size // self.block_size, self.block_size)
+                b2 = ts.view(-1, self.emb_size // self.block_size, self.block_size)
+                bl = (b1.unsqueeze(3) * b2.unsqueeze(2)).view(-1, self.emb_size * self.block_size)
+                logits = self.bilinear(bl)
+            else:
+                parts = [g_h, g_t, g_h * g_t]
+                if self.use_abs_diff:
+                    parts.append(torch.abs(g_h - g_t))
+                parts.append(context)
+                pair = torch.cat(parts, dim=-1)  # (P, 4H or 5H)
+                logits = self.classifier(self.pair_proj(pair))
             all_logits.append(logits)
 
             if labels is not None:

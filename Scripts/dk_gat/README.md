@@ -1,6 +1,54 @@
 # dk EGAT 모델 — 제안 아키텍처 파이프라인 문서
 
-> **최종 업데이트**: 2026-07-14 (그래프/pair representation 고도화): ATLoss 교체가 실측으로
+> **최종 업데이트**: 2026-07-14 (Gated Fusion / Bilinear Classifier / abs-diff 구현 + 학습 전략
+> 플래그 추가, 전부 토글식 — A/B 검증 전까지 기본값은 변경 없음):
+>
+> **JK A/B 1차 결과 (distant 3,000문서 스크리닝)**: JK off가 JK on보다 우세 (F1 26.77 vs 25.32,
+> Ign 25.81 vs 24.60) — 다만 Gated Fusion이 JK의 결합 단계를 대체하는 관계라(코드 주석 참고),
+> 최종 채택 여부는 Gated Fusion A/B 결과까지 보고 함께 결정 예정. 지금은 JK 기본값(on) 유지.
+>
+> **⭐ Gated Fusion** (`--use_gated_fusion`, 기본 off): GAT 출력과 원본(pre-GAT) 엔티티 임베딩을
+> 학습 가능한 per-dimension sigmoid 게이트로 blend — `gate=sigmoid(W[e_orig;e_gat])`,
+> `g=gate*e_gat+(1-gate)*e_orig`. GAT 메시지패싱이 강한 엔티티 표현을 이웃과 평균내며 희석시킬 수
+> 있다는 우려에 대응, JK의 max 결합 대신 학습된 결합을 씀 (JK보다 우선 적용). A/B 진행 중
+> (`logs/gate_ab.log`).
+>
+> **⭐ ATLOP식 Grouped Bilinear Classifier** (`--use_bilinear_classifier`, 기본 off): 기존
+> concat+`g_h*g_t`+MLP 분류 경로를 대체 — head/tail extractor(Linear+tanh) 후 block-wise outer
+> product(12블록×64) → Linear(768*64→97). 학습 곡선이 정상(loss 꾸준히 감소, 불안정 없음)이라 GAT
+> 자체보다 분류기 용량이 병목일 가능성에 대응. interaction term과 중복이라 대체(스택 안 함).
+> A/B 대기 중 (`logs/bilinear_ab.log`, Gated Fusion A/B 완료 후 자동 시작).
+>
+> **⭐ Pair Representation에 `abs(g_h-g_t)` 추가** (`--use_abs_diff`, 기본 off): 기존
+> `[g_h;g_t;g_h*g_t;c_ht]`에 InferSent 스타일 절대차 항을 추가 — 곱 항이 못 잡는 "head/tail 특징
+> 크기 차이" 신호. bilinear classifier 사용 시엔 무시(그 경로는 pair_proj를 안 씀). A/B 대기 중
+> (`logs/absdiff_ab.log`, Bilinear A/B 완료 후 자동 시작).
+>
+> **학습 전략 플래그 (신규, 기본값은 전부 현재 동작 그대로 — off/미변경)**: `--lr2`(stage2 전용
+> learning rate, 미지정 시 `--lr`과 동일), `--layerwise_lr_decay`(BERT 층별 LR 감쇠, 1.0=비활성),
+> `--freeze_encoder_epochs`(스테이지 시작 N epoch 동안 인코더 동결), `--evidence_start_epoch`
+> (evidence loss를 N epoch부터 curriculum 방식으로 활성화), `--early_stop_patience`(N epoch
+> 연속 dev F1 개선 없으면 조기 종료). CPU smoke test(4문서, 전 플래그 동시 적용)로 크래시 없음만
+> 확인 — 이 항목들은 여러 epoch에 걸친 수렴 양상이 핵심이라 distant-only 1epoch CPU 스크리닝으로는
+> 의미있는 A/B가 어려워, 다음 전체 Colab 실행(15 epoch)에서 실측 예정.
+>
+> 이전 (Jump Knowledge 추가 + `--epochs 0` 버그 수정):
+> ④ **Jump Knowledge**: GAT 마지막 층 출력만 쓰던 것을 `max(입력 임베딩, layer1 출력, layer2
+> 출력)`(element-wise)로 바꿈 — 분류기가 0/1/2-hop 정보 중 필요한 걸 노드마다 가져다 쓸 수 있게
+> 함. **새 파라미터 없음**(concat+Linear가 아니라 max 선택) — 같은 날 이미 이종 그래프/interaction
+> term으로 파라미터가 늘어난 상태라, "도움이 되는지 안 되는지"를 추가 용량 효과와 분리해서 보기
+> 위함. `model.py`의 `forward()`만 수정.
+>
+> **버그 수정**: `--epochs 0`(distant만 빠르게 스크리닝하는 용도, na_weight/gat_heads sweep에서
+> 사용)일 때 stage 2가 `(None, None)`을 반환해 마지막에 `len(preds)`에서 `TypeError`로 죽던 버그
+> 발견(실측: gat_heads A/B 테스트 중 발견, exit code 1). stage 2를 `if args.epochs > 0`으로
+> 감싸고 스킵 시 stage-1 결과로 폴백하도록 수정 — `Scripts/atlop/train_re.py`엔 이미 있던 가드를
+> `train_gat.py`엔 빠뜨렸던 것.
+>
+> **GAT heads A/B (참고, 반영 안 함)**: distant 3,000개 스크리닝 결과 heads=4가 heads=8보다 우세
+> (F1 26.77 vs 25.17, Ign 25.81 vs 24.45) — heads=8은 recall만 더 떨어짐. **기본값 4 유지**로 결론.
+>
+> 이전 (그래프/pair representation 고도화): ATLoss 교체가 실측으로
 > 검증됨(distant 프리트레인만 dev F1 46.58/Ign 44.21 — 20k 기준 참고치 43.15~47.79 범위 안,
 > BCE 때 24.77에서 회복 확인) → **보류해뒀던 고도화 2건을 반영**.
 > ① **Entity-Sentence Heterogeneous Graph**: 노드에 문장(Sentence)을 추가, entity-entity
