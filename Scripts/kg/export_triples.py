@@ -11,8 +11,16 @@ Neo4j에는 (전역 병합된 개체 + 문서 목록)만 적재되어 있어 evi
   "tail": {"id": "E<idx>", "name": str, "type": str},
   "confidence": 1.0,
   "source": {"document_id": str, "sentence_id": [int, ...]},
-  "evidence": [str, ...]
+  "evidence": [str, ...],
+  "evidence_source": "annotated" | "inferred_cooccurrence" | "unresolved_multihop"
 }
+
+DocRED 원본 라벨 중 일부(train_annotated 1,421개/38,180개, dev 487개/12,275개)는
+evidence가 비어 있음. 이 경우 head/tail이 같은 문장에 함께 언급되는 문장이
+있으면 그 문장(들)을 evidence로 추론해서 채우고 "inferred_cooccurrence"로
+표시함. 함께 언급되는 문장이 아예 없으면(여러 문장에 걸친 multi-hop 추론이
+필요한 경우) 억지로 채우지 않고 evidence를 비워둔 채 "unresolved_multihop"로
+표시함 — 근거 없는 추론으로 데이터 정합성을 해치지 않기 위함.
 
 사용법:
     python Scripts/kg/export_triples.py --splits train_annotated dev --out triples.jsonl
@@ -58,6 +66,9 @@ def build_records(splits, rel_info):
             sents = doc["sents"]
 
             vertex_meta = [cluster_name_type(c) for c in doc["vertexSet"]]
+            mention_sents = [
+                sorted(set(m["sent_id"] for m in cluster)) for cluster in doc["vertexSet"]
+            ]
 
             for label in doc.get("labels", []):
                 h_idx, t_idx = label["h"], label["t"]
@@ -65,6 +76,15 @@ def build_records(splits, rel_info):
                 t_name, t_type = vertex_meta[t_idx]
                 relation_id = label["r"]
                 evidence_sent_ids = label.get("evidence", [])
+                evidence_source = "annotated"
+
+                if not evidence_sent_ids:
+                    cooccur = sorted(set(mention_sents[h_idx]) & set(mention_sents[t_idx]))
+                    if cooccur:
+                        evidence_sent_ids = cooccur
+                        evidence_source = "inferred_cooccurrence"
+                    else:
+                        evidence_source = "unresolved_multihop"
 
                 yield {
                     "head": {"id": f"E{h_idx}", "name": h_name, "type": h_type},
@@ -80,6 +100,7 @@ def build_records(splits, rel_info):
                         for sid in evidence_sent_ids
                         if sid < len(sents)
                     ],
+                    "evidence_source": evidence_source,
                 }
 
 
