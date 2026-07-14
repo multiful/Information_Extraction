@@ -1,7 +1,7 @@
 """dk EGAT model: BERT encoder + ATLOP-style entity/context pooling +
 2-layer Edge-featured GAT + 2-layer MLP classifier, trained with
-BCEWithLogitsLoss + 0.2 x Evidence Contrastive Loss (InfoNCE over the
-document's sentences).
+Adaptive Thresholding (ATLoss / PUATLoss) + 0.2 x Evidence Contrastive Loss
+(InfoNCE over the document's sentences).
 
 Implements the user-specified proposed architecture (see README.md in this
 folder for the full pipeline doc and the interpretation decisions):
@@ -16,14 +16,27 @@ folder for the full pipeline doc and the interpretation decisions):
                residual + LayerNorm each layer, GELU+dropout after layer 1 only
   pair repr    Linear([g_h ; g_t ; c_ht], 2304 -> 768)
   classifier   LayerNorm -> Linear(768,768) -> GELU -> Dropout -> Linear(768,97)
-  loss         BCEWithLogitsLoss over the 97-dim multi-hot (Na = class 0)
+  loss         Adaptive Thresholding (class 0 = learned TH/Na, see
+               Scripts/atlop/losses.py) -- train_gat.py injects PUATLoss
+               (na_weight=0.7, TTM-RE-inspired) for the distant stage and
+               plain ATLoss for annotated fine-tune, exactly like
+               Scripts/atlop/train_re.py's distant_mode=pretrain flow
                + 0.2 x InfoNCE(c_ht vs sentence embeddings, positives = gold
                evidence sentences) for pairs that have evidence annotations
                (train_distant has none -> the term is silently skipped there)
 
-Prediction: sigmoid over the 96 relation columns; a relation is emitted iff
-p > threshold, where threshold is swept on dev by the training script (PRD's
-required NA-imbalance handling for BCE-style training).
+Note: this file originally used BCEWithLogitsLoss + a dev-threshold sweep.
+Switched to Adaptive Thresholding after a real run showed it measurably
+underperforming (dev F1 24.77 after distant pretrain on 20k docs, vs 43.15
+for RoBERTa+LCP+ATLoss on the same 20k subset, see
+Scripts/models/EXPERIMENTS.md experiment 2) -- BCE + post-hoc threshold only
+handles DocRED's 97% NA imbalance at decision time, not during training,
+so positive-class logits stayed undertrained. Adaptive Thresholding bakes
+the NA-vs-relation decision into the loss itself.
+
+Prediction: ATLoss.get_label(logits) -- a relation is emitted iff its logit
+exceeds the learned per-pair TH (class 0) logit, capped at top-4. No global
+threshold to sweep.
 """
 
 import sys
@@ -37,6 +50,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from Scripts.atlop.long_input import process_long_input  # noqa: E402
+from Scripts.atlop.losses import ATLoss                    # noqa: E402
 from Scripts.dk_gat.preprocess_gat import (               # noqa: E402
     EDGE_CATS, NUM_DIST_BUCKETS, NUM_ENTITY_TYPES,
 )
@@ -84,7 +98,7 @@ class EdgeFeaturedGATLayer(nn.Module):
 class DocREGATModel(nn.Module):
     def __init__(self, config, encoder, num_labels: int = 97, num_heads: int = 4,
                  dropout: float = 0.1, evidence_weight: float = 0.2,
-                 evidence_tau: float = 0.1, offset: int = 1):
+                 evidence_tau: float = 0.1, offset: int = 1, loss_fnt: nn.Module = None):
         super().__init__()
         self.config = config
         self.encoder = encoder
@@ -109,7 +123,15 @@ class DocREGATModel(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden, num_labels),
         )
-        self.bce = nn.BCEWithLogitsLoss()
+        # Adaptive Thresholding (ATLoss / PUATLoss), injected so train_gat can swap in
+        # PUATLoss(na_weight=0.7) for the distant stage and plain ATLoss for annotated
+        # fine-tune, exactly like Scripts/atlop/train_re.py -- NOT BCEWithLogitsLoss.
+        # BCE + post-hoc threshold sweep only fixes the NA imbalance at decision time,
+        # not during training, and measurably underperformed on this dataset (dev F1
+        # 24.77 with BCE vs 43.15 for RoBERTa+LCP+ATLoss on the same 20k distant subset,
+        # see Scripts/models/EXPERIMENTS.md experiment 2) -- adaptive thresholding builds
+        # the NA-vs-relation decision into the loss itself instead of a fixed/swept cutoff.
+        self.loss_fnt = loss_fnt if loss_fnt is not None else ATLoss()
 
     def encode(self, input_ids, attention_mask):
         start_tokens = [self.config.cls_token_id]
@@ -213,7 +235,7 @@ class DocREGATModel(nn.Module):
         logits = torch.cat(all_logits, dim=0)
         if labels is None:
             return (logits,)
-        loss = self.bce(logits, labels.to(logits))
+        loss = self.loss_fnt(logits, labels.to(logits))
         if ev_losses:
             loss = loss + self.evidence_weight * torch.stack(ev_losses).mean()
         return loss, logits

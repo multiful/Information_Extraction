@@ -1,12 +1,18 @@
 """Train / evaluate the dk EGAT model on DocRED.
 
 Two-stage flow mirroring Scripts/atlop/train_re.py (distant pretrain ->
-annotated fine-tune), with the differences dictated by this model's design:
-BCEWithLogitsLoss + sigmoid decoding, so the NA imbalance is handled by a
-dev-set threshold sweep (PRD section-2 requirement) instead of adaptive
-thresholding; plus the 0.2-weighted evidence contrastive loss, which is
-active only on splits that carry evidence annotations (train_annotated) and
-silently inert on train_distant.
+annotated fine-tune): Adaptive Thresholding, with PUATLoss(na_weight=0.7)
+swapped in for the distant stage only (train_distant's Na labels are
+distant-supervision noise, not confirmed negatives -- see
+Scripts/atlop/PU_THRESHOLD_EXPERIMENT.md) and plain ATLoss for annotated
+fine-tune (its Na labels are gold). Plus the 0.2-weighted evidence
+contrastive loss, active only on splits with evidence annotations
+(train_annotated) and silently inert on train_distant.
+
+Note: this file originally used BCEWithLogitsLoss + a dev threshold sweep.
+Switched after a real run showed it measurably underperforming (dev F1
+24.77 after distant pretrain on 20k docs, vs 43.15 for RoBERTa+LCP+ATLoss
+on the same subset) -- see model.py's module docstring for the diagnosis.
 
 Run from the project root:
 
@@ -17,7 +23,8 @@ Run from the project root:
     # (matches Scripts/atlop baseline's schedule exactly -- only the
     # architecture differs, so the comparison isolates that one variable)
     python -m Scripts.dk_gat.train_gat --distant_limit 20000 --distant_epochs 1 \
-        --epochs 15 --run_name dk_gat --save_model --seed 66
+        --epochs 15 --use_pu_loss --na_weight 0.7 \
+        --run_name dk_gat --save_model --seed 66
 """
 
 import argparse
@@ -37,12 +44,12 @@ sys.path.insert(0, str(ROOT))
 
 from data.docred_dataset import DocREDataset            # noqa: E402
 from data.docred_io import build_rel2id, NUM_CLASSES     # noqa: E402
+from Scripts.atlop.losses import ATLoss, PUATLoss          # noqa: E402
 from Scripts.dk_gat.model import DocREGATModel            # noqa: E402
 from Scripts.dk_gat.preprocess_gat import build_gat_features  # noqa: E402
 from Scripts.eval.scorer import evaluate                  # noqa: E402
 
 RESULTS_DIR = ROOT / "results"
-THRESHOLDS = [round(0.1 + 0.05 * i, 2) for i in range(17)]  # 0.10 .. 0.90
 
 
 def set_seed(seed: int):
@@ -71,47 +78,29 @@ def make_collate_fn(pad_token_id: int):
 
 
 @torch.no_grad()
-def collect_probs(model, loader, device):
-    """Sigmoid probabilities for every pair, kept per-doc for threshold sweep."""
+def predict(model, loader, id2rel, device):
+    """Adaptive-Thresholding decode: a relation is emitted iff its logit beats
+    the pair's own learned TH (class 0) logit -- no global threshold, matches
+    Scripts/atlop/train_re.py's predict()."""
     model.eval()
-    out = []  # (title, hts, probs ndarray (P, 97))
+    out = []
     for batch in loader:
         logits = model(batch["input_ids"].to(device), batch["attention_mask"].to(device),
                        batch["features"])[0]
-        probs = torch.sigmoid(logits).cpu().numpy()
+        # get_label is inherited unchanged by PUATLoss from ATLoss, so this works
+        # regardless of which loss_fnt is currently attached to the model.
+        mask = model.loss_fnt.get_label(logits, num_labels=-1).cpu().numpy()
         idx = 0
         for f in batch["features"]:
             n = len(f["hts"])
-            out.append((f["title"], f["hts"], probs[idx: idx + n]))
+            doc_mask = mask[idx: idx + n]
             idx += n
+            for (h, t), row in zip(f["hts"], doc_mask):
+                for r in range(1, NUM_CLASSES):
+                    if row[r] == 1:
+                        out.append({"title": f["title"], "h_idx": h, "t_idx": t, "r": id2rel[r]})
+    model.train()
     return out
-
-
-def probs_to_preds(doc_probs, id2rel, threshold: float):
-    preds = []
-    for title, hts, probs in doc_probs:
-        for (h, t), row in zip(hts, probs):
-            for r in range(1, NUM_CLASSES):  # skip Na column
-                if row[r] > threshold:
-                    preds.append({"title": title, "h_idx": h, "t_idx": t, "r": id2rel[r]})
-    return preds
-
-
-def sweep_eval(model, dev_loader, dev_docs, ign_docs, id2rel, device):
-    """Dev evaluation with a threshold sweep; returns (best_metrics, best_preds,
-    best_threshold)."""
-    doc_probs = collect_probs(model, dev_loader, device)
-    best = (None, None, None)
-    for th in THRESHOLDS:
-        preds = probs_to_preds(doc_probs, id2rel, th)
-        if not preds:
-            continue
-        m = evaluate(preds, dev_docs, ign_docs)
-        if best[0] is None or m["f1"] > best[0]["f1"]:
-            best = (m, preds, th)
-    if best[0] is None:  # no threshold produced any prediction
-        best = ({"f1": 0.0, "ign_f1": 0.0, "precision": 0.0, "recall": 0.0}, [], 0.5)
-    return best
 
 
 def run_stage(model, loader, args, device, epochs, stage, dev_loader, dev_docs, ign_docs, id2rel):
@@ -119,7 +108,7 @@ def run_stage(model, loader, args, device, epochs, stage, dev_loader, dev_docs, 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = get_linear_schedule_with_warmup(
         optimizer, int(total_steps * args.warmup_ratio), total_steps)
-    metrics, preds, th = None, None, None
+    metrics, preds = None, None
     for epoch in range(epochs):
         model.train()
         running = 0.0
@@ -135,11 +124,11 @@ def run_stage(model, loader, args, device, epochs, stage, dev_loader, dev_docs, 
             if (step + 1) % args.log_every == 0:
                 print(f"  [{stage}] epoch {epoch} step {step + 1}/{len(loader)} "
                       f"loss {running / (step + 1):.4f}", flush=True)
-        metrics, preds, th = sweep_eval(model, dev_loader, dev_docs, ign_docs, id2rel, device)
+        preds = predict(model, dev_loader, id2rel, device)
+        metrics = evaluate(preds, dev_docs, ign_docs)
         print(f"[{stage} | epoch {epoch}] train_loss={running / max(1, len(loader)):.4f} "
               f"dev_F1={metrics['f1'] * 100:.2f} Ign_F1={metrics['ign_f1'] * 100:.2f} "
-              f"(P={metrics['precision'] * 100:.2f} R={metrics['recall'] * 100:.2f} "
-              f"threshold={th})", flush=True)
+              f"(P={metrics['precision'] * 100:.2f} R={metrics['recall'] * 100:.2f})", flush=True)
     return metrics, preds
 
 
@@ -180,6 +169,9 @@ def train(args):
         cap = args.limit_docs if args.limit_docs > 0 else args.distant_limit
         if cap > 0:
             distant_docs = distant_docs[:cap]
+        if args.use_pu_loss:
+            model.loss_fnt = PUATLoss(na_weight=args.na_weight)
+            print(f"[stage 1] loss = PUATLoss(na_weight={args.na_weight})", flush=True)
         print(f"[stage 1] distant pretrain on {len(distant_docs)} docs "
               f"({args.distant_epochs} epoch(s))", flush=True)
         distant_loader = DataLoader(build_gat_features(distant_docs, tokenizer, rel2id),
@@ -193,6 +185,9 @@ def train(args):
             p = RESULTS_DIR / f"{args.run_name}_stage1.pt"
             torch.save(model.state_dict(), p)
             print(f"[saved] {p}", flush=True)
+        # annotated's Na labels are gold, not distant-supervision noise -- always
+        # plain ATLoss for stage 2, matching Scripts/atlop/train_re.py.
+        model.loss_fnt = ATLoss()
 
     print(f"[stage 2] annotated fine-tune on {len(train_docs)} docs ({args.epochs} epoch(s))",
           flush=True)
@@ -231,6 +226,12 @@ def build_argparser():
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--gat_heads", type=int, default=4)
     p.add_argument("--evidence_weight", type=float, default=0.2)
+    p.add_argument("--use_pu_loss", action="store_true",
+                   help="PUATLoss for the distant stage instead of plain ATLoss "
+                        "(na_weight=0.7 default was swept and validated on Scripts/atlop -- "
+                        "recommended on; matches Scripts/atlop/train_re.py's flag)")
+    p.add_argument("--na_weight", type=float, default=0.7,
+                   help="PUATLoss down-weight for distant all-Na pairs' TH-ranking term")
     p.add_argument("--seed", type=int, default=66)
     p.add_argument("--limit_docs", type=int, default=0, help="cap all splits; for quick runs")
     p.add_argument("--log_every", type=int, default=50)
