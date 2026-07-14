@@ -131,7 +131,7 @@ def build_param_groups(model, lr, weight_decay, layerwise_lr_decay):
 
 def run_stage(model, loader, args, device, epochs, stage, dev_loader, dev_docs, ign_docs, id2rel,
              best_ckpt_path=None, lr=None, freeze_encoder_epochs=0, evidence_start_epoch=0,
-             early_stop_patience=0):
+             early_stop_patience=0, na_weight_schedule=None):
     """best_ckpt_path: if given, save model.state_dict() there every time a new
     best dev F1 is seen (separate from the caller's own final-epoch save) --
     epoch-to-epoch dev F1 isn't monotonic (we've observed real dips, e.g.
@@ -141,7 +141,15 @@ def run_stage(model, loader, args, device, epochs, stage, dev_loader, dev_docs, 
     lr: overrides args.lr for this stage (used for --lr2, stage 2 only);
     defaults to args.lr when not given. freeze_encoder_epochs/
     evidence_start_epoch/early_stop_patience: see their --help text in
-    build_argparser -- all default to 0/disabled, i.e. current behavior."""
+    build_argparser -- all default to 0/disabled, i.e. current behavior.
+
+    na_weight_schedule: optional (start, end) tuple -- linearly anneals
+    model.loss_fnt.na_weight from `start` at step 0 to `end` at the last
+    training step of *this stage* (step-level, not epoch-level, since stage 1
+    is only 1 epoch in the controlled schedule -- an epoch-level schedule
+    would never move). Only applied when model.loss_fnt actually has a
+    na_weight attribute (i.e. PUATLoss is attached); silently skipped
+    otherwise (e.g. if called for stage 2, which uses plain ATLoss)."""
     lr = args.lr if lr is None else lr
     total_steps = max(1, len(loader) * epochs)
     param_groups = build_param_groups(model, lr, args.weight_decay, args.layerwise_lr_decay)
@@ -151,6 +159,8 @@ def run_stage(model, loader, args, device, epochs, stage, dev_loader, dev_docs, 
     metrics, preds = None, None
     best_f1, best_epoch, no_improve = -1.0, -1, 0
     base_evidence_weight = model.evidence_weight
+    apply_na_schedule = na_weight_schedule is not None and hasattr(model.loss_fnt, "na_weight")
+    global_step = 0
     for epoch in range(epochs):
         if freeze_encoder_epochs > 0:
             should_freeze = epoch < freeze_encoder_epochs
@@ -164,6 +174,10 @@ def run_stage(model, loader, args, device, epochs, stage, dev_loader, dev_docs, 
         model.train()
         running = 0.0
         for step, batch in enumerate(loader):
+            if apply_na_schedule:
+                start, end = na_weight_schedule
+                frac = global_step / max(1, total_steps - 1)
+                model.loss_fnt.na_weight = start + (end - start) * frac
             loss, _ = model(batch["input_ids"].to(device), batch["attention_mask"].to(device),
                             batch["features"], labels=batch["labels"].to(device))
             loss.backward()
@@ -172,9 +186,11 @@ def run_stage(model, loader, args, device, epochs, stage, dev_loader, dev_docs, 
             scheduler.step()
             optimizer.zero_grad()
             running += loss.item()
+            global_step += 1
             if (step + 1) % args.log_every == 0:
+                na_w_msg = f" na_weight={model.loss_fnt.na_weight:.3f}" if apply_na_schedule else ""
                 print(f"  [{stage}] epoch {epoch} step {step + 1}/{len(loader)} "
-                      f"loss {running / (step + 1):.4f}", flush=True)
+                      f"loss {running / (step + 1):.4f}{na_w_msg}", flush=True)
         preds = predict(model, dev_loader, id2rel, device)
         metrics = evaluate(preds, dev_docs, ign_docs)
         is_best = metrics["f1"] > best_f1
@@ -238,7 +254,8 @@ def train(args):
                           use_jk=not args.no_jk,
                           use_gated_fusion=args.use_gated_fusion,
                           use_bilinear_classifier=args.use_bilinear_classifier,
-                          use_abs_diff=args.use_abs_diff).to(device)
+                          use_abs_diff=args.use_abs_diff,
+                          use_metapath_attention=args.use_metapath_attention).to(device)
 
     stage1_metrics, stage1_preds = None, None
     if args.distant_epochs > 0:
@@ -256,12 +273,18 @@ def train(args):
                                     collate_fn=collate)
         RESULTS_DIR.mkdir(exist_ok=True)
         stage1_best = RESULTS_DIR / f"{args.run_name}_stage1_best.pt" if args.save_model else None
+        na_weight_schedule = ((args.na_weight_start, args.na_weight)
+                              if args.curriculum_na_weight else None)
+        if args.curriculum_na_weight and not args.use_pu_loss:
+            print("[warning] --curriculum_na_weight has no effect without --use_pu_loss "
+                  "(plain ATLoss has no na_weight to anneal)", flush=True)
         stage1_metrics, stage1_preds = run_stage(
             model, distant_loader, args, device, args.distant_epochs,
             "distant-pretrain", dev_loader, dev_docs, train_docs, id2rel,
             best_ckpt_path=stage1_best, freeze_encoder_epochs=args.freeze_encoder_epochs,
             evidence_start_epoch=args.evidence_start_epoch,
-            early_stop_patience=args.early_stop_patience)
+            early_stop_patience=args.early_stop_patience,
+            na_weight_schedule=na_weight_schedule)
         del distant_loader, distant_docs
         if args.save_model:
             p = RESULTS_DIR / f"{args.run_name}_stage1.pt"
@@ -357,6 +380,13 @@ def build_argparser():
                    help="append |g_h - g_t| to the pair representation (InferSent-style), "
                         "alongside the existing g_h*g_t term. Ignored when "
                         "--use_bilinear_classifier is set. Off by default -- A/B test first")
+    p.add_argument("--use_metapath_attention", action="store_true",
+                   help="separate GAT attention vector per edge category (self / "
+                        "entity-entity same-sentence / entity-entity mention-overlap / "
+                        "entity-sentence) instead of one shared vector for all edges -- see "
+                        "EdgeFeaturedGATLayer's docstring in model.py. Off by default -- "
+                        "unlike the other use_* flags this has NOT been distant-screened yet, "
+                        "only CPU smoke-tested for crash-freedom; treat as unvalidated")
     p.add_argument("--evidence_weight", type=float, default=0.2)
     p.add_argument("--evidence_start_epoch", type=int, default=0,
                    help="curriculum: evidence contrastive loss is added only from this "
@@ -391,7 +421,24 @@ def build_argparser():
                         "(na_weight=0.7 default was swept and validated on Scripts/atlop -- "
                         "recommended on; matches Scripts/atlop/train_re.py's flag)")
     p.add_argument("--na_weight", type=float, default=0.7,
-                   help="PUATLoss down-weight for distant all-Na pairs' TH-ranking term")
+                   help="PUATLoss down-weight for distant all-Na pairs' TH-ranking term -- "
+                        "also the *end* value of the curriculum when --curriculum_na_weight "
+                        "is set")
+    p.add_argument("--curriculum_na_weight", action="store_true",
+                   help="anneal PUATLoss na_weight linearly from --na_weight_start (step 0) "
+                        "to --na_weight (last step) over the distant stage, instead of holding "
+                        "it fixed at --na_weight throughout. Motivation: at step 0 the GAT/"
+                        "classifier heads are randomly initialized and can't yet tell a "
+                        "mislabeled distant Na pair from a real one, so trusting the distant "
+                        "labels fully (na_weight closer to 1.0, i.e. plain ATLoss behavior) "
+                        "gives a cleaner bootstrapping signal; as training progresses toward "
+                        "the validated na_weight=0.7, the down-weighting of likely-noisy Na "
+                        "labels phases in. No-op (with a printed warning) unless --use_pu_loss "
+                        "is also set. Requires --distant_epochs > 0. Off by default -- "
+                        "unvalidated (new this session, only CPU smoke-tested)")
+    p.add_argument("--na_weight_start", type=float, default=1.0,
+                   help="starting na_weight for --curriculum_na_weight (1.0 = fully trust "
+                        "distant Na labels at step 0, i.e. plain ATLoss)")
     p.add_argument("--seed", type=int, default=66)
     p.add_argument("--limit_docs", type=int, default=0, help="cap all splits; for quick runs")
     p.add_argument("--log_every", type=int, default=50)
