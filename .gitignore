@@ -44,5 +44,5 @@ docred_data/data/_fact_cache/
 .env.*
 *.key
 
-# Claude Code 로컬 설정 (개인 환경별 설정, 팀 공유 대상 아님)
-.claude/
+# 로컬 스크래치 노트북 (커밋 안 함)
+ffy.ipynb
