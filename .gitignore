@@ -32,3 +32,6 @@ Scripts/models/dk_filtered_distant.json
 
 # DocRED 공식 스코어러의 train fact 캐시 (Scripts/docred_scorer.py가 재생성)
 docred_data/data/_fact_cache/
+
+# Re-DocRED revised 라벨은 main에 Git LFS로 관리 → dh엔 커밋하지 않음(로컬/LFS pull로만 사용)
+docred_data/data/*_revised.json

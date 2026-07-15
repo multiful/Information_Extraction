@@ -6,7 +6,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "docred_data" / "data"
 
-SPLITS = ["train_annotated", "train_distant", "dev", "test"]
+SPLITS = ["train_annotated", "train_distant", "dev", "test",
+          "train_revised", "dev_revised", "test_revised"]  # Re-DocRED (수정본 라벨)
 
 
 def load_split(name: str) -> list[dict]:
