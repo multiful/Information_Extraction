@@ -38,7 +38,8 @@ def main():
         r.relation_id AS relation_id, r.relation_name AS relation_name, type(r) AS relation_type,
         t.id AS tail_id, t.name AS tail_name, t.type AS tail_type,
         r.confidence AS confidence, r.split AS split, r.document AS document,
-        r.sentence_id AS sentence_id, r.evidence AS evidence, r.evidence_source AS evidence_source
+        r.sentence_id AS sentence_id, r.evidence AS evidence, r.evidence_source AS evidence_source,
+        r.is_revised AS is_revised
     """
 
     with driver.session(database=database) as session:
@@ -51,7 +52,7 @@ def main():
                     "relation_id", "relation_name", "relation_type",
                     "tail_id", "tail_name", "tail_type",
                     "confidence", "split", "document",
-                    "sentence_id", "evidence", "evidence_source",
+                    "sentence_id", "evidence", "evidence_source", "is_revised",
                 ]
             )
             n = 0
@@ -64,7 +65,7 @@ def main():
                         record["confidence"], record["split"], record["document"],
                         "; ".join(str(s) for s in record["sentence_id"]),
                         " | ".join(record["evidence"]),
-                        record["evidence_source"],
+                        record["evidence_source"], record["is_revised"],
                     ]
                 )
                 n += 1

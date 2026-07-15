@@ -16,7 +16,8 @@ CREATE TABLE IF NOT EXISTS relations (
     document TEXT NOT NULL,
     sentence_id JSONB NOT NULL,
     evidence JSONB NOT NULL,
-    evidence_source TEXT NOT NULL
+    evidence_source TEXT NOT NULL,
+    is_revised BOOLEAN NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_relations_head_id ON relations(head_id);

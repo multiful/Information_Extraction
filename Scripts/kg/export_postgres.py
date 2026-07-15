@@ -46,7 +46,8 @@ CREATE TABLE IF NOT EXISTS relations (
     document TEXT NOT NULL,
     sentence_id JSONB NOT NULL,
     evidence JSONB NOT NULL,
-    evidence_source TEXT NOT NULL
+    evidence_source TEXT NOT NULL,
+    is_revised BOOLEAN NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_relations_head_id ON relations(head_id);
@@ -98,7 +99,8 @@ def main():
                 h.id AS head_id, t.id AS tail_id,
                 r.relation_id AS relation_id, r.relation_name AS relation_name,
                 r.confidence AS confidence, r.split AS split, r.document AS document,
-                r.sentence_id AS sentence_id, r.evidence AS evidence, r.evidence_source AS evidence_source
+                r.sentence_id AS sentence_id, r.evidence AS evidence, r.evidence_source AS evidence_source,
+                r.is_revised AS is_revised
             """
         )
         n_relations = 0
@@ -108,7 +110,7 @@ def main():
                 [
                     "head_id", "tail_id", "relation_id", "relation_name",
                     "confidence", "split", "document",
-                    "sentence_id", "evidence", "evidence_source",
+                    "sentence_id", "evidence", "evidence_source", "is_revised",
                 ]
             )
             for record in result:
@@ -119,7 +121,7 @@ def main():
                         record["confidence"], record["split"], record["document"],
                         json.dumps(record["sentence_id"], ensure_ascii=False),
                         json.dumps(record["evidence"], ensure_ascii=False),
-                        record["evidence_source"],
+                        record["evidence_source"], record["is_revised"],
                     ]
                 )
                 n_relations += 1

@@ -78,3 +78,11 @@ def iter_doc_records(splits):
 
 def global_entity_id(name, type_):
     return f"{name}::{type_}"
+
+
+def is_revised_split(split):
+    """`train_revised`/`dev_revised`처럼 사람이 재정제(Re-DocRED)한 split인지.
+
+    `_revised` 접미사가 없는 split(train_annotated/dev/train_distant)은 False —
+    향후 2단계(모델 예측 triple)도 여기서 False로 떨어지므로 별도 처리 불필요."""
+    return split.endswith("_revised")
