@@ -1,6 +1,32 @@
 # dk EGAT 모델 — 제안 아키텍처 파이프라인 문서
 
-> **최종 업데이트**: 2026-07-15 (**`train_baseline.py`에 PUATLoss/early stopping/best-epoch
+> **최종 업데이트**: 2026-07-15 (**PUATLoss(0.7) revised 데이터셋 실측 결과 확정(baseline보다
+> 낮음, 채택 안 함) — Entity-Pair Graph 단독 실험으로 전환**): `atlop_pu07_revised` 실행이
+> 완료됨 — `--early_stop_patience 5`가 실제로 발동해 epoch 13에서 조기 종료(best epoch 8).
+> best 체크포인트 기준 dev F1 73.30/Ign F1 72.20, test(best ckpt) F1 73.67/Ign F1 72.60 —
+> plain baseline(final 73.67/72.95, 실제 peak epoch14 73.97/73.14)보다 dev 기준 −0.37~−0.94
+> **낮음**. 바로 아래 항목에서 예상했던 대로("positive label 과다추정 노이즈에는
+> na_weight=0.7의 Na쪽 down-weighting 메커니즘이 안 맞음") 개선되지 않음이 실측으로 확인돼
+> baseline을 대체하지 않고 실험 결과로만 기록(노트북 "결과 기록" 셀) — 이 데이터셋에서 PU
+> loss는 더 이상 시도하지 않기로 함.
+>
+> 대신 `colab_gat_a100.ipynb` 셀 4를 `Scripts.dk_gat.train_baseline`(그래프 없음)에서
+> `Scripts.dk_gat.train_gat`(GAT)로 교체하고 **Entity-Pair Graph(`--use_pair_graph
+> --pair_graph_dim 256`)만 단독** 추가 — 과거 원본 데이터 15epoch 풀런에서 baseline(61.71)
+> 보다 낮게 나온 Gated Fusion/Bilinear Classifier(60.62)와 방금 위에서 확인된 PU loss는
+> 제외, Meta-path Attention/Curriculum PU-weight/layerwise_lr_decay/freeze_encoder_epochs/
+> evidence_start_epoch/evidence_fusion도 전부 미검증이라 기본값 유지 — pair-graph 하나의
+> 순수 효과만 baseline과 비교하기 위함. Entity-Pair Graph는 zero-init 잔차 헤드라 켜서
+> 나빠질 위험이 작고, `docred_data/data/relations_revised.csv` 확인상 `train_revised.json`
+> 라벨의 28.8%가 `unresolved_multihop`(근거 문장 없는 합성 추론)이라 이 데이터셋과 특히
+> 맞을 수 있다는 가설(정확히 Entity-Pair Graph가 노리는 A→B,B→C⇒A→C 신호) — 단 원본
+> 데이터에서도 항상 다른 미검증 요소와 번들로만 시도돼 단독 검증된 적이 없어, 이번이 사실상
+> 첫 실측. `--early_stop_patience 5` + best-epoch 체크포인트는 `train_gat.py`에 이미 있는
+> 기능 그대로 사용. CPU smoke test(`--limit_docs 6 --epochs 3 --use_pair_graph
+> --early_stop_patience 2`)로 크래시 없음 확인 — 사용자 결정으로 성능 스크리닝은 생략하고
+> 바로 전체 20epoch 실행(`run_name=dk_gat_pairgraph_revised`).
+>
+> 이전 (**`train_baseline.py`에 PUATLoss/early stopping/best-epoch
 > 체크포인트 저장 추가 — revised 데이터셋 baseline 확정**): `colab_gat_a100.ipynb`(revised
 > 데이터, distant 없이 단일 스테이지)가 순수 baseline(PU loss/early stopping/best-checkpoint
 > 전부 없음)으로 완주한 실측 결과를 확인 — 마지막 epoch(19) dev F1 73.67/Ign F1 72.95, test
