@@ -25,6 +25,19 @@ Run from the project root:
     python -m Scripts.dk_gat.train_gat --distant_limit 20000 --distant_epochs 1 \
         --epochs 15 --use_pu_loss --na_weight 0.7 \
         --run_name dk_gat --save_model --seed 66
+
+    # revised-data run (no distant stage): train/dev/test are ad-hoc json
+    # files instead of the named train_annotated/dev/train_distant splits --
+    # --distant_epochs 0 skips the distant stage entirely (it's just not
+    # invoked, no distant_revised file needed), and --test_file runs a final
+    # triple-prediction pass (+ F1/Ign F1 if the file has labels) after
+    # training, without affecting early stopping/checkpoint selection.
+    python -m Scripts.dk_gat.train_gat \
+        --train_split docred_data/data/train_revised.json \
+        --dev_split docred_data/data/dev_revised.json \
+        --test_file docred_data/data/test_revised.json \
+        --distant_epochs 0 --epochs 20 \
+        --run_name dk_gat_revised --save_model --seed 66
 """
 
 import argparse
@@ -42,6 +55,7 @@ from transformers import get_linear_schedule_with_warmup
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
+from data import docred_io                              # noqa: E402
 from data.docred_dataset import DocREDataset            # noqa: E402
 from data.docred_io import build_rel2id, NUM_CLASSES     # noqa: E402
 from Scripts.atlop.losses import ATLoss, PUATLoss          # noqa: E402
@@ -50,6 +64,23 @@ from Scripts.dk_gat.preprocess_gat import build_gat_features  # noqa: E402
 from Scripts.eval.scorer import evaluate                  # noqa: E402
 
 RESULTS_DIR = ROOT / "results"
+
+
+def load_docs(split_or_path: str) -> list:
+    """`split_or_path`: a named split from data.docred_io.SPLITS (loaded via
+    DocREDataset, current behavior), or -- for anything else -- a path
+    (absolute, or relative to the project root) to a DocRED-format json file
+    (list of {title, sents, vertexSet, labels}), loaded directly. Lets
+    --train_split/--dev_split/--distant_split/--test_file point at ad-hoc
+    files (e.g. docred_data/data/train_revised.json) without touching the
+    shared data/docred_io.py SPLITS list."""
+    if split_or_path in docred_io.SPLITS:
+        return list(DocREDataset(split_or_path))
+    path = Path(split_or_path)
+    if not path.is_absolute():
+        path = ROOT / path
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
 
 
 def set_seed(seed: int):
@@ -241,8 +272,8 @@ def train(args):
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
     collate = make_collate_fn(tokenizer.pad_token_id)
 
-    train_docs = list(DocREDataset("train_annotated"))
-    dev_docs = list(DocREDataset("dev"))
+    train_docs = load_docs(args.train_split)
+    dev_docs = load_docs(args.dev_split)
     if args.limit_docs > 0:
         train_docs = train_docs[: args.limit_docs]
         dev_docs = dev_docs[: args.limit_docs]
@@ -273,7 +304,7 @@ def train(args):
 
     stage1_metrics, stage1_preds = None, None
     if args.distant_epochs > 0:
-        distant_docs = list(DocREDataset("train_distant"))
+        distant_docs = load_docs(args.distant_split)
         cap = args.limit_docs if args.limit_docs > 0 else args.distant_limit
         if cap > 0:
             distant_docs = distant_docs[:cap]
@@ -369,6 +400,30 @@ def train(args):
             print(f"[best checkpoint] dev_F1={best_metrics['f1'] * 100:.2f} "
                   f"Ign_F1={best_metrics['ign_f1'] * 100:.2f} -- "
                   f"saved {best_pred_path} ({len(best_preds)} predicted relations)", flush=True)
+
+    if args.test_file:
+        # Runs on whatever weights the model currently holds -- the best-dev-F1
+        # checkpoint if --save_model produced one (loaded in-place just above),
+        # otherwise the final-epoch weights. No training/early-stopping signal
+        # is derived from this split.
+        test_docs = load_docs(args.test_file)
+        test_loader = DataLoader(build_gat_features(test_docs, tokenizer, rel2id),
+                                 batch_size=args.eval_batch_size, shuffle=False, collate_fn=collate)
+        test_preds = predict(model, test_loader, id2rel, device,
+                             evidence_fusion=args.evidence_fusion,
+                             evidence_fusion_top_k=args.evidence_fusion_top_k)
+        test_pred_path = RESULTS_DIR / f"{args.run_name}_test_predictions.json"
+        with open(test_pred_path, "w", encoding="utf-8") as fp:
+            json.dump(test_preds, fp, ensure_ascii=False)
+        used_best = args.save_model and best_ckpt is not None and best_ckpt.exists()
+        print(f"[saved] {test_pred_path}  ({len(test_preds)} predicted relations, "
+              f"{'best' if used_best else 'final'} checkpoint)", flush=True)
+        if any(doc.get("labels") for doc in test_docs):
+            test_metrics = evaluate(test_preds, test_docs, train_docs)
+            print(f"[test] F1={test_metrics['f1'] * 100:.2f} "
+                  f"Ign_F1={test_metrics['ign_f1'] * 100:.2f} "
+                  f"(P={test_metrics['precision'] * 100:.2f} R={test_metrics['recall'] * 100:.2f})",
+                  flush=True)
     return metrics
 
 
@@ -376,6 +431,22 @@ def build_argparser():
     p = argparse.ArgumentParser(description="dk EGAT model on DocRED")
     p.add_argument("--model_name_or_path", default="bert-base-cased")
     p.add_argument("--run_name", default="dk_gat")
+    p.add_argument("--train_split", default="train_annotated",
+                   help="named split (data/docred_io.SPLITS) or a path (absolute, or relative "
+                        "to the project root) to a DocRED-format json file, for the annotated "
+                        "fine-tune stage -- e.g. docred_data/data/train_revised.json")
+    p.add_argument("--dev_split", default="dev",
+                   help="named split or json path used for dev eval / early stopping / "
+                        "best-checkpoint selection")
+    p.add_argument("--distant_split", default="train_distant",
+                   help="named split or json path for the distant pretrain stage (only loaded "
+                        "if --distant_epochs > 0)")
+    p.add_argument("--test_file", default=None,
+                   help="optional json path for a held-out split to run final triple "
+                        "prediction on after training completes (e.g. "
+                        "docred_data/data/test_revised.json) -- no effect on training or "
+                        "checkpoint selection. If the docs have a labels key, F1/Ign F1 are "
+                        "also printed")
     p.add_argument("--epochs", type=int, default=15,
                    help="annotated fine-tune epochs (matches Scripts/atlop baseline's 15 "
                         "for a controlled architecture-only comparison)")
