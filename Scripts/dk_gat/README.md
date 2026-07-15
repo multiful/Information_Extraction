@@ -1,6 +1,72 @@
 # dk EGAT 모델 — 제안 아키텍처 파이프라인 문서
 
-> **최종 업데이트**: 2026-07-14 (**Evidence Fusion 추가 — EIDER 스타일 추론 시점 기법,
+> **최종 업데이트**: 2026-07-15 (**🏁 dk_gat 트랙 종료 — plain ATLOP baseline 채택, 팀은
+> 도현님 모델 사용**): `colab_gat_a100.ipynb`에서 revised 데이터셋 기준 3개 조합을 실측
+> 비교 완료 — plain ATLOP baseline(`atlop_baseline_revised`) dev F1 73.67/Ign F1 72.95(**채택**),
+> + PUATLoss(0.7)(`atlop_pu07_revised`) 73.30/72.20(baseline보다 낮음), + Entity-Pair
+> Graph(`dk_gat_pairgraph_revised`) 71.95/71.05(baseline보다 더 낮음). 두 개선 시도 모두
+> baseline을 못 넘김 — PU loss는 이 데이터셋 노이즈(positive 라벨 과다추정)가
+> na_weight=0.7이 겨냥하는 메커니즘(distant Na 라벨 노이즈)과 안 맞아서, Entity-Pair
+> Graph는 원본 데이터셋에서 시도했던 다른 GAT 조합들(heterogeneous-graph-only, Gated
+> Fusion+Bilinear)과 같은 패턴(baseline 미달)으로 재확인됨 — **그래프 증강이 이 프로젝트
+> 에서 3전 3패**. 팀은 도현님이 만든 모델을 최종으로 사용하기로 하여, 이 dk_gat 트랙은
+> plain ATLOP baseline(revised, 73.67/72.95) 기록을 끝으로 종료 — 추가 실험 없음. 상세
+> 로그/근거는 `colab_gat_a100.ipynb`의 "결과 기록" 셀 참고.
+>
+> 이전 (**PUATLoss(0.7) revised 데이터셋 실측 결과 확정(baseline보다
+> 낮음, 채택 안 함) — Entity-Pair Graph 단독 실험으로 전환**): `atlop_pu07_revised` 실행이
+> 완료됨 — `--early_stop_patience 5`가 실제로 발동해 epoch 13에서 조기 종료(best epoch 8).
+> best 체크포인트 기준 dev F1 73.30/Ign F1 72.20, test(best ckpt) F1 73.67/Ign F1 72.60 —
+> plain baseline(final 73.67/72.95, 실제 peak epoch14 73.97/73.14)보다 dev 기준 −0.37~−0.94
+> **낮음**. 바로 아래 항목에서 예상했던 대로("positive label 과다추정 노이즈에는
+> na_weight=0.7의 Na쪽 down-weighting 메커니즘이 안 맞음") 개선되지 않음이 실측으로 확인돼
+> baseline을 대체하지 않고 실험 결과로만 기록(노트북 "결과 기록" 셀) — 이 데이터셋에서 PU
+> loss는 더 이상 시도하지 않기로 함.
+>
+> 대신 `colab_gat_a100.ipynb` 셀 4를 `Scripts.dk_gat.train_baseline`(그래프 없음)에서
+> `Scripts.dk_gat.train_gat`(GAT)로 교체하고 **Entity-Pair Graph(`--use_pair_graph
+> --pair_graph_dim 256`)만 단독** 추가 — 과거 원본 데이터 15epoch 풀런에서 baseline(61.71)
+> 보다 낮게 나온 Gated Fusion/Bilinear Classifier(60.62)와 방금 위에서 확인된 PU loss는
+> 제외, Meta-path Attention/Curriculum PU-weight/layerwise_lr_decay/freeze_encoder_epochs/
+> evidence_start_epoch/evidence_fusion도 전부 미검증이라 기본값 유지 — pair-graph 하나의
+> 순수 효과만 baseline과 비교하기 위함. Entity-Pair Graph는 zero-init 잔차 헤드라 켜서
+> 나빠질 위험이 작고, `docred_data/data/relations_revised.csv` 확인상 `train_revised.json`
+> 라벨의 28.8%가 `unresolved_multihop`(근거 문장 없는 합성 추론)이라 이 데이터셋과 특히
+> 맞을 수 있다는 가설(정확히 Entity-Pair Graph가 노리는 A→B,B→C⇒A→C 신호) — 단 원본
+> 데이터에서도 항상 다른 미검증 요소와 번들로만 시도돼 단독 검증된 적이 없어, 이번이 사실상
+> 첫 실측. `--early_stop_patience 5` + best-epoch 체크포인트는 `train_gat.py`에 이미 있는
+> 기능 그대로 사용. CPU smoke test(`--limit_docs 6 --epochs 3 --use_pair_graph
+> --early_stop_patience 2`)로 크래시 없음 확인 — 사용자 결정으로 성능 스크리닝은 생략하고
+> 바로 전체 20epoch 실행(`run_name=dk_gat_pairgraph_revised`).
+>
+> 이전 (**`train_baseline.py`에 PUATLoss/early stopping/best-epoch
+> 체크포인트 저장 추가 — revised 데이터셋 baseline 확정**): `colab_gat_a100.ipynb`(revised
+> 데이터, distant 없이 단일 스테이지)가 순수 baseline(PU loss/early stopping/best-checkpoint
+> 전부 없음)으로 완주한 실측 결과를 확인 — 마지막 epoch(19) dev F1 73.67/Ign F1 72.95, test
+> F1 73.48/Ign F1 72.77, 실제 peak는 epoch 14(dev F1 73.97/Ign F1 73.14)였으나 저장 로직이
+> 없어 그 체크포인트는 남지 않음. 이를 **revised 데이터셋의 baseline**으로 확정하고(수치는
+> 노트북 "결과 기록" 셀에 기록, `results/comparison.md`는 원본 데이터 전용이라 섞지 않음),
+> 다음 실행부터 개선을 걸기 위해 `Scripts/dk_gat/train_baseline.py`에 `train_gat.py`와 동일한
+> 패턴으로 세 가지를 포팅: ① `--use_pu_loss --na_weight`(트랙3 `atlop_full_pu07`에서 검증된
+> `na_weight=0.7`을 그대로 가져와 적용 — `train_revised.json` 구성엔 distant 단계가 없어 이
+> 유일한 학습 스테이지에 직접 적용, `--distant_epochs > 0`이면 기존 관례대로 distant만 PU
+> loss/annotated는 자동으로 plain ATLoss로 전환). **⚠️ 이 0.7은 revised 데이터셋에서
+> 검증된 값이 아님** — `docred_data/data/relations_revised.csv` 확인 결과
+> `train_revised.json` label의 53.0%만 `evidence_source=annotated`(사람 검증)이고 나머지
+> 47%는 `unresolved_multihop`(28.8%)/`inferred_cooccurrence`(18.2%) 자동 추론(`confidence`
+> 컬럼은 전부 1.0이라 신뢰도 구분 불가) — 즉 이 데이터셋의 잠재 노이즈는 **positive label
+> 과다추정**(false positive 위험) 쪽이지, na_weight=0.7이 원래 겨냥하는 **distant
+> supervision의 Na(negative) 라벨 노이즈**(원본 train_distant에서 실측된 "dev 정답의
+> 62.2%가 Na로 잘못 라벨링됨")와 메커니즘이 다름. 따라서 이번 실행은 "검증된 조합 적용"이
+> 아니라 plain 베이스라인과 비교하는 **실험**으로 취급 — 개선이 확인돼야 새 기준으로 승격
+> (노트북 "결과 기록" 셀 참고). ② `--early_stop_patience`(N epoch 연속 dev F1 미개선 시 조기
+> 종료), ③ best-epoch 체크포인트 저장(`{run_name}_best.pt`/`_best_dev_predictions.json`, 매
+> epoch dev F1 갱신 시 저장 — 위에서 확인된 "마지막 epoch이 peak가 아닐 수 있다" 문제를 막기
+> 위함, 이 둘은 데이터셋과 무관하게 항상 유효). CPU smoke test(`--limit_docs 6 --epochs 3
+> --use_pu_loss --early_stop_patience 2`)로 크래시 없이 동작 확인 — 다음 Colab 실행
+> (`run_name=atlop_pu07_revised`, `--early_stop_patience 5`)이 첫 실측.
+>
+> 이전 (2026-07-14, **Evidence Fusion 추가 — EIDER 스타일 추론 시점 기법,
 > 학습 불필요**): 외부 논문 조사 결과, 지금까지 실패해온 "인코딩 후 그래프를 얹는" 계열
 > 말고 완전히 다른 지점(추론 시점 예측 융합)을 건드리는 EIDER(Xie et al., Findings ACL
 > 2022)를 채택. **새 파라미터 없음** — 이미 학습된 아무 체크포인트에나 바로 켜볼 수 있음.
