@@ -16,6 +16,9 @@ venv/
 # OS
 .DS_Store
 
+# Secrets (Neo4j Aura credentials, etc.)
+.env
+
 # 모델 산출물 (재생성 가능) — 예측 결과/체크포인트. comparison.md는 추적함
 results/*.json
 results/*.pt
@@ -30,8 +33,16 @@ Scripts/models/predictions/
 Scripts/models/*.log
 Scripts/models/dk_filtered_distant.json
 
+# dk_gat CPU A/B 스크리닝 스크립트/로그 (재생성 가능, run별 ad-hoc) -- 결론은 README.md에 기록
+Scripts/dk_gat/logs/
+
 # DocRED 공식 스코어러의 train fact 캐시 (Scripts/docred_scorer.py가 재생성)
 docred_data/data/_fact_cache/
 
-# Re-DocRED revised 라벨은 main에 Git LFS로 관리 → dh엔 커밋하지 않음(로컬/LFS pull로만 사용)
-docred_data/data/*_revised.json
+# API 키 등 비밀값 (OpenAI API 키는 절대 커밋 금지 — 환경변수로만 주입)
+.env
+.env.*
+*.key
+
+# 로컬 스크래치 노트북 (커밋 안 함)
+ffy.ipynb

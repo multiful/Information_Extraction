@@ -19,7 +19,7 @@ any HF encoder and can be handed a tiny random encoder for CPU smoke tests.
 import torch
 import torch.nn as nn
 
-from .losses import ATLoss
+from .losses import ATLoss, evidence_loss
 from .long_input import process_long_input
 
 
@@ -53,13 +53,23 @@ class DocREModel(nn.Module):
         )
         return sequence_output, attention
 
-    def get_hrt(self, sequence_output, attention, entity_pos, hts):
+    def get_hrt(self, sequence_output, attention, entity_pos, hts, sent_pos=None):
         """Pool per-entity embeddings (log-sum-exp over mention markers) and
         per-pair localized-context vectors. Returns (hs, rs, ts), each
-        (total_pairs, hidden), concatenated across the batch in hts order."""
+        (total_pairs, hidden), concatenated across the batch in hts order.
+
+        If `sent_pos` is given (one (start, end) span per sentence, per doc),
+        also returns `sent_attns`: a list of (n_pair_i, n_sent_i) tensors, one
+        per doc, giving how much of each pair's localized-context attention
+        mass falls on each sentence. This is the DREEAM evidence-guided
+        attention signal — it lets the training loop compare "where the model
+        is looking" against the gold evidence sentences, so low-scoring but
+        evidence-relevant tokens aren't washed out just because the raw
+        attention over them is small."""
         offset = self.offset
         _, num_heads, _, c = attention.size()
         hss, tss, rss = [], [], []
+        sent_attns = [] if sent_pos is not None else None
 
         for i in range(len(entity_pos)):
             entity_embs, entity_atts = [], []
@@ -108,14 +118,33 @@ class DocREModel(nn.Module):
             tss.append(ts)
             rss.append(rs)
 
+            if sent_pos is not None:
+                spans = sent_pos[i]
+                if spans and ht_att.size(0) > 0:
+                    sent_attn = torch.stack(
+                        [ht_att[:, min(s + offset, c): min(e + offset, c)].sum(dim=1)
+                         for s, e in spans],
+                        dim=1,
+                    )  # (n_pair, n_sent)
+                else:
+                    sent_attn = ht_att.new_zeros((ht_att.size(0), 0))
+                sent_attns.append(sent_attn)
+
         hss = torch.cat(hss, dim=0)
         tss = torch.cat(tss, dim=0)
         rss = torch.cat(rss, dim=0)
+        if sent_pos is not None:
+            return hss, rss, tss, sent_attns
         return hss, rss, tss
 
-    def forward(self, input_ids, attention_mask, entity_pos, hts, labels=None):
+    def forward(self, input_ids, attention_mask, entity_pos, hts, labels=None,
+                sent_pos=None, evidence=None, evi_lambda: float = 0.0):
         sequence_output, attention = self.encode(input_ids, attention_mask)
-        hs, rs, ts = self.get_hrt(sequence_output, attention, entity_pos, hts)
+        if sent_pos is not None:
+            hs, rs, ts, sent_attns = self.get_hrt(sequence_output, attention, entity_pos, hts, sent_pos)
+        else:
+            hs, rs, ts = self.get_hrt(sequence_output, attention, entity_pos, hts)
+            sent_attns = None
 
         hs = torch.tanh(self.head_extractor(torch.cat([hs, rs], dim=1)))
         ts = torch.tanh(self.tail_extractor(torch.cat([ts, rs], dim=1)))
@@ -134,5 +163,7 @@ class DocREModel(nn.Module):
                 labels = torch.as_tensor(labels, dtype=torch.float)
             labels = labels.to(dtype=torch.float, device=logits.device)
             loss = self.loss_fnt(logits, labels)
+            if sent_attns is not None and evidence is not None and evi_lambda > 0:
+                loss = loss + evi_lambda * evidence_loss(sent_attns, evidence)
             output = (loss,) + output
         return output

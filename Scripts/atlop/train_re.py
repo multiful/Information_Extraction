@@ -15,10 +15,19 @@ Two-stage flow; the stage order is selected with --distant_mode:
            predictions saved in the team's common format — directly comparable
            to the track-1 models.
 
+--evi_lambda > 0 additionally enables the DREEAM evidence-guided attention loss
+(Ma et al., ACL 2023): the localized-context attention is supervised against
+gold evidence sentences (annotated/dev only; train_distant has no evidence, so
+that stage is unaffected). Default 0.0 reproduces the pre-DREEAM baseline
+exactly, since sent_pos/evidence are only forwarded to the model when enabled.
+
 Run from the project root, e.g.
 
     # full run, paper order (GPU / Colab recommended — this repo's torch is CPU-only)
     python -m Scripts.atlop.train_re --epochs 30 --distant_limit 20000 --save_model
+
+    # same, with DREEAM evidence-guided attention enabled
+    python -m Scripts.atlop.train_re --epochs 30 --distant_limit 20000 --evi_lambda 0.1 --save_model
 
     # quick CPU sanity run on a handful of docs
     python -m Scripts.atlop.train_re --limit_docs 8 --epochs 1 --distant_epochs 1
@@ -79,6 +88,8 @@ def make_collate_fn(pad_token_id: int):
             "attention_mask": attention_mask,
             "entity_pos": [f["entity_pos"] for f in features],
             "hts": [f["hts"] for f in features],
+            "sent_pos": [f["sent_pos"] for f in features],
+            "evidence": [f["evidence"] for f in features],
             "labels": labels,
             "features": features,
         }
@@ -174,12 +185,23 @@ def run_stage(model, loader, args, device, epochs, stage, dev_loader, dev_docs,
         model.train()
         running = 0.0
         for step, batch in enumerate(loader):
+            # sent_pos/evidence are only forwarded when the DREEAM evidence-guided
+            # attention loss is enabled, so --evi_lambda 0 (the default) reproduces
+            # the exact old code path/behavior.
+            evi_kwargs = {}
+            if args.evi_lambda > 0:
+                evi_kwargs = {
+                    "sent_pos": batch["sent_pos"],
+                    "evidence": batch["evidence"],
+                    "evi_lambda": args.evi_lambda,
+                }
             loss = model(
                 input_ids=batch["input_ids"].to(device),
                 attention_mask=batch["attention_mask"].to(device),
                 entity_pos=batch["entity_pos"],
                 hts=batch["hts"],
                 labels=batch["labels"],
+                **evi_kwargs,
             )[0]
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
@@ -341,6 +363,11 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--emb_size", type=int, default=768)
     p.add_argument("--block_size", type=int, default=64)
     p.add_argument("--seed", type=int, default=66)
+    p.add_argument("--evi_lambda", type=float, default=0.0,
+                   help="weight of the DREEAM evidence-guided attention loss "
+                        "(0 = off, reproduces the pre-DREEAM baseline exactly; "
+                        "~0.1 enables it). No effect on splits without gold "
+                        "evidence (e.g. train_distant), which stay Na/unsupervised.")
     p.add_argument("--limit_docs", type=int, default=0, help="cap train/dev docs (0 = all); for quick runs")
     p.add_argument("--log_every", type=int, default=50)
     p.add_argument("--save_model", action="store_true")

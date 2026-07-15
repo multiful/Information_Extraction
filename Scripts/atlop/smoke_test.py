@@ -86,6 +86,30 @@ def main():
     print(f"[model] backward OK, {sum(grads)}/{len(grads)} params have grads")
     assert all(grads), "some params did not receive gradients"
 
+    # DREEAM evidence-guided attention: sent_pos/evidence wiring + backward.
+    model.zero_grad()
+    n_sent = [len(f["sent_pos"]) for f in features[:3]]
+    n_evi_pairs = sum(1 for f in features[:3] for evi in f["evidence"] if evi)
+    print(f"[dreeam] sentences per doc={n_sent}, pairs with gold evidence={n_evi_pairs}")
+    loss_evi, preds_evi = model(
+        input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        entity_pos=batch["entity_pos"],
+        hts=batch["hts"],
+        labels=batch["labels"],
+        sent_pos=batch["sent_pos"],
+        evidence=batch["evidence"],
+        evi_lambda=0.1,
+    )
+    # (predictions will differ slightly from the base run above due to encoder
+    # dropout noise between forward passes, not the evidence loss itself)
+    assert preds_evi.shape == preds.shape
+    print(f"[dreeam] loss_with_evidence={loss_evi.item():.4f} (base={loss.item():.4f})")
+    loss_evi.backward()
+    grads_evi = [p.grad is not None for p in model.parameters() if p.requires_grad]
+    print(f"[dreeam] backward OK, {sum(grads_evi)}/{len(grads_evi)} params have grads")
+    assert all(grads_evi), "some params did not receive gradients with evidence loss enabled"
+
     # predict -> common format -> scorer
     from torch.utils.data import DataLoader
     loader = DataLoader(features, batch_size=2, shuffle=False, collate_fn=collate)

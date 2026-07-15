@@ -1,5 +1,10 @@
 # dk 브랜치 실험 기록
 
+> **[폐기, 2026-07-14]** 이 문서의 모델(RoBERTa + LCP + AT + PU)은 최종 dev F1 61.77/Ign 59.98로
+> `Scripts/atlop` baseline(61.71/59.86) 대비 +0.06/+0.12 — seed 변동폭(±1점) 이내라 유의미한 우위로
+> 보기 어려워 폐기 결정. 이후 작업은 `Scripts/dk_gat`(Baseline + Edge-featured GAT)로 이어짐. 아래
+> 기록은 과거 실험 이력으로 보존.
+>
 > **최종 업데이트**: 2026-07-13: 실험 3(최종 파이프라인) distant 전체(101,873개, 34 chunk) +
 > annotated 8epoch 파인튜닝 결과 추가 (dev F1 0.5710 → 0.6177). 공식 Ign-F1 스코어러
 > (`Scripts/docred_scorer.py`, thunlp/DocRED 포팅) 신규 구현 및 재평가 (Ign F1 0.5998, ATLOP
