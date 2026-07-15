@@ -1,6 +1,8 @@
 # Knowledge Graph 적재 (`Scripts/kg/`)
 
-> **최종 업데이트**: 2026-07-14: 관계 엣지를 문서 간 병합하지 않도록 재설계 — 같은 (head, tail, relation) triple이 여러 문서에서 나오면 엣지를 여러 개 만들고, 각 엣지가 `confidence`/`document`/`sentence_id`/`evidence`/`evidence_source`를 온전한 속성으로 가짐 (LangGraph 등에서 관계별 근거를 바로 꺼내 쓸 수 있도록). 공용 로직을 `docred_common.py`로 분리하고, Pinecone(`export_pinecone.py`)·PostgreSQL/Supabase(`export_postgres.py`) export 스크립트 추가.
+> **최종 업데이트**: 2026-07-15: `pinecone_upsert.jsonl`을 실제로 OpenAI(`text-embedding-3-small`)로 임베딩해서 Pinecone 인덱스(`informationrag`)에 업서트하는 `upsert_pinecone.py` 추가 (인덱스가 없으면 서버리스로 자동 생성). `requirements.txt`에 `openai`/`pinecone` 추가, 필요 환경변수 `OPENAI_API_KEY`/`PINECONE_API_KEY`/`PINECONE_INDEX_NAME`을 `.env`에 추가.
+>
+> 2026-07-14: 관계 엣지를 문서 간 병합하지 않도록 재설계 — 같은 (head, tail, relation) triple이 여러 문서에서 나오면 엣지를 여러 개 만들고, 각 엣지가 `confidence`/`document`/`sentence_id`/`evidence`/`evidence_source`를 온전한 속성으로 가짐 (LangGraph 등에서 관계별 근거를 바로 꺼내 쓸 수 있도록). 공용 로직을 `docred_common.py`로 분리하고, Pinecone(`export_pinecone.py`)·PostgreSQL/Supabase(`export_postgres.py`) export 스크립트 추가.
 
 ## 1단계: 확실한 정보 적재 (Ground Truth)
 
@@ -47,7 +49,8 @@ Neo4j 그래프를 그대로 다른 시스템에 옮겨 쓸 수 있도록 내보
 |---|---|---|
 | `export_csv.py` | `triples.csv` | Excel/pandas로 바로 열어보는 평면 CSV (head/relation/tail/confidence/document/sentence_id/evidence/evidence_source) |
 | `export_triples.py` | `triples.jsonl`, `unresolved_multihop.jsonl` | 원본 DocRED에서 직접 뽑은 문서 단위 raw triple (엔티티 id가 문서 내 vertexSet 인덱스, 전역 병합 없음) — 요청받은 head/relation/tail/source/evidence JSON 스키마 |
-| `export_pinecone.py` | `pinecone_upsert.jsonl` | Pinecone upsert용 `{id, text, metadata}`. `text`는 evidence 문장을 이어붙인 것(없으면 `"{head} {relation} {tail}"`로 대체). 임베딩은 직접 만들지 않음 — 어떤 모델을 쓸지는 사용자가 정해서 `text`를 임베딩한 뒤 upsert하면 됨. `metadata`는 Pinecone 제약(문자열/숫자/불리언/문자열리스트, 중첩 객체 불가)에 맞춰 평평하게 구성. |
+| `export_pinecone.py` | `pinecone_upsert.jsonl` | Pinecone upsert용 `{id, text, metadata}`. `text`는 evidence 문장을 이어붙인 것(없으면 `"{head} {relation} {tail}"`로 대체). `metadata`는 Pinecone 제약(문자열/숫자/불리언/문자열리스트, 중첩 객체 불가)에 맞춰 평평하게 구성. |
+| `upsert_pinecone.py` | Pinecone 인덱스(`informationrag`) | `pinecone_upsert.jsonl`을 읽어 OpenAI `text-embedding-3-small`로 `text`를 임베딩하고 Pinecone에 업서트. 인덱스가 없으면 서버리스로 자동 생성. `--dry-run`으로 실제 API 호출 없이 건수/토큰만 확인 가능, `--limit N`으로 일부만 테스트 가능. |
 | `export_postgres.py` | `schema.sql`, `entities.csv`, `relations.csv` | PostgreSQL(Supabase)용. `entities`/`relations` 2개 테이블, `relations.head_id`/`tail_id`가 `entities.id`를 참조하는 FK. `aliases`/`sentence_id`/`evidence`는 JSONB. Supabase SQL Editor에서 `schema.sql` 실행 후 Table Editor로 CSV 임포트(entities 먼저), 또는 `psql`의 `\copy`. |
 
 ## 다음 단계 (미구현)
