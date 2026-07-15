@@ -1,6 +1,33 @@
 # dk EGAT 모델 — 제안 아키텍처 파이프라인 문서
 
-> **최종 업데이트**: 2026-07-14 (**Evidence Fusion 추가 — EIDER 스타일 추론 시점 기법,
+> **최종 업데이트**: 2026-07-15 (**`train_baseline.py`에 PUATLoss/early stopping/best-epoch
+> 체크포인트 저장 추가 — revised 데이터셋 baseline 확정**): `colab_gat_a100.ipynb`(revised
+> 데이터, distant 없이 단일 스테이지)가 순수 baseline(PU loss/early stopping/best-checkpoint
+> 전부 없음)으로 완주한 실측 결과를 확인 — 마지막 epoch(19) dev F1 73.67/Ign F1 72.95, test
+> F1 73.48/Ign F1 72.77, 실제 peak는 epoch 14(dev F1 73.97/Ign F1 73.14)였으나 저장 로직이
+> 없어 그 체크포인트는 남지 않음. 이를 **revised 데이터셋의 baseline**으로 확정하고(수치는
+> 노트북 "결과 기록" 셀에 기록, `results/comparison.md`는 원본 데이터 전용이라 섞지 않음),
+> 다음 실행부터 개선을 걸기 위해 `Scripts/dk_gat/train_baseline.py`에 `train_gat.py`와 동일한
+> 패턴으로 세 가지를 포팅: ① `--use_pu_loss --na_weight`(트랙3 `atlop_full_pu07`에서 검증된
+> `na_weight=0.7`을 그대로 가져와 적용 — `train_revised.json` 구성엔 distant 단계가 없어 이
+> 유일한 학습 스테이지에 직접 적용, `--distant_epochs > 0`이면 기존 관례대로 distant만 PU
+> loss/annotated는 자동으로 plain ATLoss로 전환). **⚠️ 이 0.7은 revised 데이터셋에서
+> 검증된 값이 아님** — `docred_data/data/relations_revised.csv` 확인 결과
+> `train_revised.json` label의 53.0%만 `evidence_source=annotated`(사람 검증)이고 나머지
+> 47%는 `unresolved_multihop`(28.8%)/`inferred_cooccurrence`(18.2%) 자동 추론(`confidence`
+> 컬럼은 전부 1.0이라 신뢰도 구분 불가) — 즉 이 데이터셋의 잠재 노이즈는 **positive label
+> 과다추정**(false positive 위험) 쪽이지, na_weight=0.7이 원래 겨냥하는 **distant
+> supervision의 Na(negative) 라벨 노이즈**(원본 train_distant에서 실측된 "dev 정답의
+> 62.2%가 Na로 잘못 라벨링됨")와 메커니즘이 다름. 따라서 이번 실행은 "검증된 조합 적용"이
+> 아니라 plain 베이스라인과 비교하는 **실험**으로 취급 — 개선이 확인돼야 새 기준으로 승격
+> (노트북 "결과 기록" 셀 참고). ② `--early_stop_patience`(N epoch 연속 dev F1 미개선 시 조기
+> 종료), ③ best-epoch 체크포인트 저장(`{run_name}_best.pt`/`_best_dev_predictions.json`, 매
+> epoch dev F1 갱신 시 저장 — 위에서 확인된 "마지막 epoch이 peak가 아닐 수 있다" 문제를 막기
+> 위함, 이 둘은 데이터셋과 무관하게 항상 유효). CPU smoke test(`--limit_docs 6 --epochs 3
+> --use_pu_loss --early_stop_patience 2`)로 크래시 없이 동작 확인 — 다음 Colab 실행
+> (`run_name=atlop_pu07_revised`, `--early_stop_patience 5`)이 첫 실측.
+>
+> 이전 (2026-07-14, **Evidence Fusion 추가 — EIDER 스타일 추론 시점 기법,
 > 학습 불필요**): 외부 논문 조사 결과, 지금까지 실패해온 "인코딩 후 그래프를 얹는" 계열
 > 말고 완전히 다른 지점(추론 시점 예측 융합)을 건드리는 EIDER(Xie et al., Findings ACL
 > 2022)를 채택. **새 파라미터 없음** — 이미 학습된 아무 체크포인트에나 바로 켜볼 수 있음.
