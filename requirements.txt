@@ -28,6 +28,6 @@ ipykernel==6.31.0
 neo4j==5.26.0
 python-dotenv==1.0.1
 
-# Knowledge Graph export (Scripts/kg/upsert_pinecone.py -> OpenAI 임베딩 + Pinecone)
-openai==1.109.1
-pinecone==5.4.2
+# RAG 벡터 적재 (RAG/pinecone.py, Scripts/kg/upsert_pinecone.py -> OpenAI 임베딩 + Pinecone)
+openai==2.35.1
+pinecone==7.3.0

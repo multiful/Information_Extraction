@@ -72,6 +72,33 @@ two effects (loss fix vs. graph/interaction upgrade) aren't conflated.
 Prediction: ATLoss.get_label(logits) -- a relation is emitted iff its logit
 exceeds the learned per-pair TH (class 0) logit, capped at top-4. No global
 threshold to sweep.
+
+Entity-Pair Graph (use_pair_graph, off by default, new -- see the class
+docstrings below for the full rationale): a second, optional graph stage
+whose nodes are (h,t) PAIRS themselves (one node per row of hts), not
+entities. This directly targets the "A->B, B->C explicit in the document,
+A->C must be inferred by composition" gap that the entity+sentence GAT above
+only addresses indirectly (it refines individual entity embeddings by
+mixing in neighborhood context; it has no channel for "pair (a,c) reads what
+pair (a,b) currently predicts"). The pair-graph runs AFTER the provisional
+logits are computed (from either classifier path above) and adds a
+zero-init residual on top, so at initialization the model is exactly the
+no-pair-graph model -- it can only help, never destabilize the existing,
+already-validated pipeline, and any regression is attributable to the graph
+actually hurting rather than to changed initialization.
+
+Evidence Fusion (evidence_fusion=True, forward() kwarg, off by default --
+inference-time only, no new parameters, see _evidence_fusion_context /
+_classify): EIDER-style (Xie et al., Findings ACL 2022) fusion of the normal
+full-document prediction with a second prediction made from an evidence-only
+LCP context, cheaply approximated by re-pooling the already-computed
+sequence_output/attention instead of a second BERT forward pass over a
+reconstructed document. Evidence sentences are predicted per-pair from the
+model's own context/sentence-embedding similarity (no gold evidence needed,
+so it works at test time too) -- a more direct reuse of that similarity than
+the InfoNCE evidence loss, which only contrasts it against gold labels
+during annotated training. Meant to be toggled on only in train_gat.py's
+predict() (see its docstring), never during the training forward pass.
 """
 
 import sys
@@ -97,30 +124,61 @@ class EdgeFeaturedGATLayer(nn.Module):
     """One EGAT layer: multi-head attention over graph neighbors where the
     score also sees the edge embedding -- alpha_ij = softmax_j over
     LeakyReLU(a^T [W h_i || W h_j || e_ij]) -- followed by residual + LayerNorm
-    (+ optional GELU/dropout, layer-1 only per the spec)."""
+    (+ optional GELU/dropout, layer-1 only per the spec).
+
+    use_metapath_attention (off by default): instead of one shared attention
+    vector `a` for every edge, use a separate `a_cat` per edge category
+    (self-loop / entity-entity same-sentence / entity-entity mention-overlap /
+    entity-sentence). With a single shared `a`, edge-type information only
+    reaches the attention score indirectly through e_ij's learned embedding;
+    a per-category `a` lets the model learn a genuinely different scoring
+    function per edge type (e.g. weigh mention-overlap neighbors differently
+    from same-sentence-only ones) instead of one function modulated by an
+    embedding. This is the practical, edge-categorized-graph analogue of
+    meta-path-specific attention in heterogeneous GAT literature (HAN etc.) --
+    there are no actual multi-hop meta-paths here (entity-sentence-entity is
+    already the graph's 2-hop route, handled by stacking 2 GAT layers), so
+    "meta-path" here means per-edge-category, the finest relation-type
+    granularity this graph exposes. Adds (EDGE_CATS - 1) x more `att`
+    parameters (a few thousand floats, negligible next to the encoder) --
+    everything else (proj, edge embeddings themselves) stays shared."""
 
     def __init__(self, dim: int = 768, edge_dim: int = EDGE_EMB_DIM,
-                 num_heads: int = 4, dropout: float = 0.1, final_gelu: bool = True):
+                 num_heads: int = 4, dropout: float = 0.1, final_gelu: bool = True,
+                 use_metapath_attention: bool = False, num_edge_cats: int = 5):
         super().__init__()
         assert dim % num_heads == 0
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.proj = nn.Linear(dim, dim)
-        self.att = nn.Parameter(torch.empty(num_heads, 2 * self.head_dim + edge_dim))
+        self.use_metapath_attention = use_metapath_attention
+        att_shape = ((num_edge_cats, num_heads, 2 * self.head_dim + edge_dim)
+                     if use_metapath_attention
+                     else (num_heads, 2 * self.head_dim + edge_dim))
+        self.att = nn.Parameter(torch.empty(att_shape))
         nn.init.xavier_uniform_(self.att)
         self.leaky = nn.LeakyReLU(0.2)
         self.norm = nn.LayerNorm(dim)
         self.dropout = nn.Dropout(dropout)
         self.final_gelu = final_gelu
 
-    def forward(self, x: torch.Tensor, edge_emb: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
-        # x (N, dim) / edge_emb (N, N, edge_dim) / adj (N, N) bool (self-loops included)
+    def forward(self, x: torch.Tensor, edge_emb: torch.Tensor, adj: torch.Tensor,
+                edge_cat_idx: torch.Tensor = None) -> torch.Tensor:
+        # x (N, dim) / edge_emb (N, N, edge_dim) / adj (N, N) bool (self-loops
+        # included) / edge_cat_idx (N, N) long -- raw edge-category id per
+        # pair, only needed (and required) when use_metapath_attention is on.
         n = x.size(0)
         h = self.proj(x).view(n, self.num_heads, self.head_dim)
         hi = h.unsqueeze(1).expand(n, n, self.num_heads, self.head_dim)
         hj = h.unsqueeze(0).expand(n, n, self.num_heads, self.head_dim)
         e = edge_emb.unsqueeze(2).expand(n, n, self.num_heads, edge_emb.size(-1))
-        scores = self.leaky((torch.cat([hi, hj, e], dim=-1) * self.att).sum(-1))  # (N, N, H)
+        cat_vec = torch.cat([hi, hj, e], dim=-1)  # (N, N, H, 2*head_dim+edge_dim)
+        if self.use_metapath_attention:
+            assert edge_cat_idx is not None, "use_metapath_attention needs edge_cat_idx"
+            att_sel = self.att[edge_cat_idx]  # (N, N, H, feat) -- per-pair attention vector
+            scores = self.leaky((cat_vec * att_sel).sum(-1))  # (N, N, H)
+        else:
+            scores = self.leaky((cat_vec * self.att).sum(-1))  # (N, N, H)
         scores = scores.masked_fill(~adj.unsqueeze(-1), -1e30)
         alpha = self.dropout(torch.softmax(scores, dim=1))
         out = torch.einsum("ijh,jhd->ihd", alpha, h).reshape(n, -1)
@@ -130,12 +188,82 @@ class EdgeFeaturedGATLayer(nn.Module):
         return out
 
 
+PAIR_EDGE_TYPES = 4  # same-head, same-tail, bridge-succ, bridge-pred
+
+
+def _build_pair_adjacency(ht: torch.Tensor) -> torch.Tensor:
+    """ht: (m, 2) long tensor of (head_entity, tail_entity) ids, one row per
+    pair-node -- this document's hts, same order as the logits/labels rows
+    it parallels. Returns a bool (4, m, m) typed adjacency; self-connections
+    removed (self info is handled inside the layer itself).
+
+      type 0  same-head   : (a,b)-(a,c)          h_i == h_j
+      type 1  same-tail   : (a,c)-(b,c)          t_i == t_j
+      type 2  bridge-succ : (a,b) -> (b,c)       t_i == h_j (j continues i's chain)
+      type 3  bridge-pred : (b,c) -> (a,b)       h_i == t_j (j precedes i's chain)
+
+    For the target pair (a,c): its same-head neighbors include premise
+    (a,b), its same-tail neighbors include premise (b,c) -- one propagation
+    layer already lets (a,c) read both premises of an a->b->c chain. The two
+    bridge types (rather than one symmetric `t_i==h_j OR h_i==t_j` type) let
+    the layer tell "I am the first leg of a chain" apart from "I am the
+    second leg" -- composition is directional, a single undirected edge
+    can't distinguish those two roles."""
+    h, t = ht[:, 0], ht[:, 1]
+    same_head = h.unsqueeze(1) == h.unsqueeze(0)
+    same_tail = t.unsqueeze(1) == t.unsqueeze(0)
+    bridge_succ = t.unsqueeze(1) == h.unsqueeze(0)
+    bridge_pred = h.unsqueeze(1) == t.unsqueeze(0)
+    adj = torch.stack([same_head, same_tail, bridge_succ, bridge_pred])
+    eye = torch.eye(ht.size(0), dtype=torch.bool, device=ht.device)
+    return adj & ~eye
+
+
+class EntityPairGATLayer(nn.Module):
+    """Multi-head graph attention over the entity-PAIR graph from
+    _build_pair_adjacency (nodes = (h,t) pairs, not entities/sentences --
+    unrelated to EdgeFeaturedGATLayer above despite the similar shape).
+    Dot-product attention masked to graph neighbors (+self), plus a
+    learnable additive bias per (edge type, head) so a head can specialize
+    (e.g. one head upweighting bridge-succ for chain composition)."""
+
+    def __init__(self, dim: int, heads: int = 4, dropout: float = 0.1):
+        super().__init__()
+        assert dim % heads == 0, "pair_graph_dim must be divisible by pair_graph_heads"
+        self.heads = heads
+        self.head_dim = dim // heads
+        self.qkv = nn.Linear(dim, 3 * dim)
+        self.out = nn.Linear(dim, dim)
+        self.type_bias = nn.Parameter(torch.zeros(PAIR_EDGE_TYPES, heads))
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
+        m = x.size(0)
+        q, k, v = self.qkv(x).chunk(3, dim=-1)
+        q = q.view(m, self.heads, self.head_dim).transpose(0, 1)
+        k = k.view(m, self.heads, self.head_dim).transpose(0, 1)
+        v = v.view(m, self.heads, self.head_dim).transpose(0, 1)
+
+        scores = q @ k.transpose(-2, -1) / self.head_dim ** 0.5
+        scores = scores + torch.einsum("kmn,kh->hmn", adj.to(x.dtype), self.type_bias)
+        allowed = adj.any(0) | torch.eye(m, dtype=torch.bool, device=x.device)
+        scores = scores.masked_fill(~allowed.unsqueeze(0), float("-inf"))
+
+        att = self.dropout(torch.softmax(scores, dim=-1))
+        out = (att @ v).transpose(0, 1).reshape(m, -1)
+        return self.norm(x + self.dropout(self.out(out)))
+
+
 class DocREGATModel(nn.Module):
     def __init__(self, config, encoder, num_labels: int = 97, num_heads: int = 4,
                  dropout: float = 0.1, evidence_weight: float = 0.2,
                  evidence_tau: float = 0.1, offset: int = 1, loss_fnt: nn.Module = None,
                  use_jk: bool = True, use_gated_fusion: bool = False,
-                 use_bilinear_classifier: bool = False, use_abs_diff: bool = False):
+                 use_bilinear_classifier: bool = False, use_abs_diff: bool = False,
+                 use_metapath_attention: bool = False, use_pair_graph: bool = False,
+                 pair_graph_layers: int = 2, pair_graph_dim: int = 256,
+                 pair_graph_heads: int = 4):
         super().__init__()
         self.config = config
         self.encoder = encoder
@@ -177,6 +305,33 @@ class DocREGATModel(nn.Module):
         # in context). Ignored when use_bilinear_classifier is on (that path doesn't
         # use the concat pair_proj at all). Off by default -- A/B test first.
         self.use_abs_diff = use_abs_diff
+        # Meta-path attention: per-edge-category attention vector instead of one
+        # shared vector for every edge -- see EdgeFeaturedGATLayer's docstring for
+        # the full rationale/interpretation. Off by default -- unlike gated_fusion/
+        # bilinear_classifier/abs_diff above, this has NOT been distant-screened yet
+        # (new this session); treat as unvalidated until an A/B run confirms it.
+        self.use_metapath_attention = use_metapath_attention
+        # Entity-Pair Graph: second graph stage over (h,t) pair-nodes, targeting
+        # A->B,B->C=>A->C composition directly (see module docstring / the two
+        # classes above). Off by default -- new this session, CPU smoke-tested
+        # only, not distant-screened yet. zero-init graph_out below means it
+        # can only help relative to the no-pair-graph model, never destabilize it.
+        self.use_pair_graph = use_pair_graph
+        if use_pair_graph:
+            self.pair_graph_in = nn.Linear(2 * hidden, pair_graph_dim)
+            # relation-conditioned message: lets a neighbor pair-node read "what
+            # relation do you currently look like", not just raw entity/context
+            # features -- needed for actual composition (father_of + father_of
+            # => grandfather_of), not just "these pairs are contextually related".
+            self.pair_logit_to_graph = nn.Linear(num_labels, pair_graph_dim)
+            self.pair_gnn = nn.ModuleList(
+                EntityPairGATLayer(pair_graph_dim, heads=pair_graph_heads, dropout=dropout)
+                for _ in range(pair_graph_layers)
+            )
+            # zero-init residual head: at init the model IS the no-pair-graph model.
+            self.pair_graph_out = nn.Linear(pair_graph_dim, num_labels)
+            nn.init.zeros_(self.pair_graph_out.weight)
+            nn.init.zeros_(self.pair_graph_out.bias)
         if use_bilinear_classifier:
             self.emb_size = hidden
             self.block_size = 64
@@ -191,8 +346,10 @@ class DocREGATModel(nn.Module):
         self.dist_emb = nn.Embedding(NUM_DIST_BUCKETS, 8)
         self.type_emb = nn.Embedding(NUM_ENTITY_TYPES, 8)
 
-        self.gat1 = EdgeFeaturedGATLayer(hidden, EDGE_EMB_DIM, num_heads, dropout, final_gelu=True)
-        self.gat2 = EdgeFeaturedGATLayer(hidden, EDGE_EMB_DIM, num_heads, dropout, final_gelu=False)
+        self.gat1 = EdgeFeaturedGATLayer(hidden, EDGE_EMB_DIM, num_heads, dropout, final_gelu=True,
+                                          use_metapath_attention=use_metapath_attention)
+        self.gat2 = EdgeFeaturedGATLayer(hidden, EDGE_EMB_DIM, num_heads, dropout, final_gelu=False,
+                                          use_metapath_attention=use_metapath_attention)
 
         # [g_h ; g_t ; g_h*g_t ; c_ht] -> MLP path -- only built when NOT using the
         # bilinear classifier (mutually exclusive, see use_bilinear_classifier
@@ -265,6 +422,67 @@ class DocREGATModel(nn.Module):
         tj = types.unsqueeze(0).expand(n, n, 8)
         return torch.cat([cat, dist, ti, tj], dim=-1)  # (N, N, 32)
 
+    def _classify(self, g_h, g_t, context):
+        """Run the configured classifier head (bilinear or MLP+interaction) on
+        a given (g_h, g_t, context) triple -- factored out so evidence-fusion
+        inference (below) can call it a second time with an evidence-only
+        context without duplicating the branch."""
+        if self.use_bilinear_classifier:
+            hs = torch.tanh(self.head_extractor(torch.cat([g_h, context], dim=-1)))
+            ts = torch.tanh(self.tail_extractor(torch.cat([g_t, context], dim=-1)))
+            b1 = hs.view(-1, self.emb_size // self.block_size, self.block_size)
+            b2 = ts.view(-1, self.emb_size // self.block_size, self.block_size)
+            bl = (b1.unsqueeze(3) * b2.unsqueeze(2)).view(-1, self.emb_size * self.block_size)
+            return self.bilinear(bl)
+        parts = [g_h, g_t, g_h * g_t]
+        if self.use_abs_diff:
+            parts.append(torch.abs(g_h - g_t))
+        parts.append(context)
+        pair = torch.cat(parts, dim=-1)
+        return self.classifier(self.pair_proj(pair))
+
+    def _evidence_fusion_context(self, context, joint, seq_i, sent_emb, sent_spans_i, top_k):
+        """EIDER-style (Xie et al., Findings ACL 2022) inference-time evidence
+        fusion, cheap-approximation variant: instead of re-encoding a
+        reconstructed evidence-only document through BERT a second time (the
+        paper's approach), reuse the already-computed sequence_output/joint
+        attention from this forward pass and just re-pool LCP context
+        restricted to each pair's own predicted evidence sentences.
+
+        Evidence prediction needs no gold evidence labels (must work at
+        inference/test time, where none exist): score each sentence by cosine
+        similarity between its embedding and the pair's ORIGINAL full-document
+        LCP context, the same similarity function the InfoNCE evidence loss
+        already trains during annotated fine-tuning -- just reused
+        unsupervised here instead of contrasted against gold evidence.
+        Top-`top_k` sentences per pair are kept; the joint (head*tail)
+        attention distribution is renormalized over only those sentences'
+        token positions to give an evidence-focused LCP context, which the
+        caller reclassifies and fuses with the full-document prediction.
+        Pairs with no sentences (shouldn't happen, num_sents>0 guaranteed by
+        caller) fall back to the original context."""
+        sent_emb_n = F.normalize(sent_emb, dim=-1)              # (S, H)
+        context_n = F.normalize(context, dim=-1)                # (P, H)
+        sims = context_n @ sent_emb_n.t()                       # (P, S)
+        k = min(top_k, sent_emb.size(0))
+        top_idx = sims.topk(k, dim=1).indices                   # (P, k)
+
+        p, length = joint.shape
+        ev_mask = torch.zeros(p, length, dtype=torch.bool, device=joint.device)
+        for s_idx, (s, e) in enumerate(sent_spans_i):
+            s, e = s + self.offset, min(e + self.offset, length)
+            if e <= s:
+                continue
+            hits = (top_idx == s_idx).any(dim=1)                # (P,) pairs picking this sentence
+            if hits.any():
+                ev_mask[hits, s:e] = True
+
+        joint_ev = joint * ev_mask
+        denom = joint_ev.sum(1, keepdim=True)
+        valid = denom.squeeze(1) > 1e-12
+        context_ev = (joint_ev / denom.clamp(min=1e-30)) @ seq_i
+        return torch.where(valid.unsqueeze(1), context_ev, context)
+
     def _evidence_loss(self, context, hts_i, evidence_i, sent_embs, num_sents):
         """InfoNCE: pull each pair's LCP context toward its gold evidence
         sentences, against the document's other sentences. Skipped when the doc
@@ -293,13 +511,22 @@ class DocREGATModel(nn.Module):
             return None
         return torch.stack(losses).mean()
 
-    def forward(self, input_ids, attention_mask, batch_features, labels=None):
+    def forward(self, input_ids, attention_mask, batch_features, labels=None,
+                evidence_fusion: bool = False, evidence_fusion_top_k: int = 3):
         """batch_features: the raw per-doc feature dicts (entity_pos, hts,
         edge_cat, edge_dist, adj, entity_types, sent_spans, evidence,
         num_entities, num_sentences -- edge_cat/edge_dist/adj/entity_types are
         now sized (num_entities+num_sentences)^2, see preprocess_gat.py).
         Returns (loss, logits) in training, (logits,) otherwise; logits are
-        concatenated over the batch in hts order."""
+        concatenated over the batch in hts order.
+
+        evidence_fusion: inference-time only (see _evidence_fusion_context) --
+        averages the normal full-document classifier logits with a second
+        pass over an evidence-only LCP context, no new parameters. Intended
+        to be passed by train_gat.py's predict() only, never during training
+        (it doesn't change the loss, and doubles the classifier-head compute
+        of every step for no training benefit -- it's an EIDER-style
+        prediction-time trick, not a training-time one)."""
         sequence_output, attention = self.encode(input_ids, attention_mask)
         device = input_ids.device
 
@@ -313,6 +540,8 @@ class DocREGATModel(nn.Module):
 
             edge_emb = self._edge_embeddings(f["edge_cat"], f["edge_dist"], f["entity_types"], device)
             adj = torch.as_tensor(f["adj"], dtype=torch.bool, device=device)
+            edge_cat_idx = (torch.as_tensor(f["edge_cat"], dtype=torch.long, device=device)
+                            if self.use_metapath_attention else None)
             # Jump Knowledge: element-wise max over {input, layer-1, layer-2} instead of
             # only using the last layer's output. Each GAT layer already has its own
             # residual (x + out), so some "jumping" happens internally, but that only
@@ -324,8 +553,8 @@ class DocREGATModel(nn.Module):
             # already increasing parameter count on a fixed 3,053-doc annotated set,
             # this keeps the "did it help" signal attributable to the JK idea itself
             # rather than to extra capacity.
-            h1 = self.gat1(node_emb, edge_emb, adj)
-            h2 = self.gat2(h1, edge_emb, adj)
+            h1 = self.gat1(node_emb, edge_emb, adj, edge_cat_idx=edge_cat_idx)
+            h2 = self.gat2(h1, edge_emb, adj, edge_cat_idx=edge_cat_idx)
             if self.use_gated_fusion:
                 # Learned per-dimension gate between the original entity embedding and
                 # the GAT-refined one -- entity rows only (sentence nodes have no
@@ -349,24 +578,25 @@ class DocREGATModel(nn.Module):
             context = joint @ seq_i  # (P, H) Localized Context Pooling
 
             g_h, g_t = g[ht[:, 0]], g[ht[:, 1]]
-            if self.use_bilinear_classifier:
-                # ATLOP-style grouped bilinear: head/tail each get their own
-                # [entity; context] projection, then a block-wise outer product
-                # captures many more cross-terms than a single g_h*g_t. Replaces
-                # the interaction term entirely (see __init__ comment).
-                hs = torch.tanh(self.head_extractor(torch.cat([g_h, context], dim=-1)))
-                ts = torch.tanh(self.tail_extractor(torch.cat([g_t, context], dim=-1)))
-                b1 = hs.view(-1, self.emb_size // self.block_size, self.block_size)
-                b2 = ts.view(-1, self.emb_size // self.block_size, self.block_size)
-                bl = (b1.unsqueeze(3) * b2.unsqueeze(2)).view(-1, self.emb_size * self.block_size)
-                logits = self.bilinear(bl)
-            else:
-                parts = [g_h, g_t, g_h * g_t]
-                if self.use_abs_diff:
-                    parts.append(torch.abs(g_h - g_t))
-                parts.append(context)
-                pair = torch.cat(parts, dim=-1)  # (P, 4H or 5H)
-                logits = self.classifier(self.pair_proj(pair))
+            logits = self._classify(g_h, g_t, context)
+
+            if evidence_fusion and f["num_sentences"] > 0:
+                context_ev = self._evidence_fusion_context(
+                    context, joint, seq_i, sent_emb, f["sent_spans"], evidence_fusion_top_k)
+                logits_ev = self._classify(g_h, g_t, context_ev)
+                logits = (logits + logits_ev) / 2
+
+            if self.use_pair_graph:
+                # second graph stage: nodes = this doc's (h,t) pairs, not entities.
+                # node feature = entity-level repr (g_h,g_t) + this pair's own
+                # provisional relation prediction -- so (a,c) can read what (a,b)
+                # and (b,c) currently look like, not just their context.
+                pg = torch.tanh(self.pair_graph_in(torch.cat([g_h, g_t], dim=-1)))
+                pg = pg + self.pair_logit_to_graph(logits)
+                pair_adj = _build_pair_adjacency(ht)
+                for layer in self.pair_gnn:
+                    pg = layer(pg, pair_adj)
+                logits = logits + self.pair_graph_out(pg)
             all_logits.append(logits)
 
             if labels is not None:
