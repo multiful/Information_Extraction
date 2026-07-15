@@ -1,6 +1,10 @@
 # Knowledge Graph 적재 (`Scripts/kg/`)
 
-> **최종 업데이트**: 2026-07-15: `upsert_pinecone.py`가 대상 Pinecone 인덱스(`informationrag`)의 기존 차원(현재 512)을 `describe_index`로 조회해서 그 차원으로 임베딩하도록 수정 — 인덱스가 이미 다른 차원으로 만들어져 있으면 기본값(1536)으로 임베딩할 때 `Vector dimension ... does not match` 에러가 났던 문제 수정.
+> **최종 업데이트**: 2026-07-15: `docred_common.resolve_evidence`에 bridging sentence 추론 추가 (`inferred_bridge`) — head/tail이 같은 문장에 공존하지 않는 multi-hop 라벨(29,670개, 1단계 대상 전체 라벨의 29%)에 대해, head가 언급된 문장과 tail이 언급된 문장 중 **공유하는 제3의 개체가 있는 문장 쌍**(거리가 가장 가까운 것)을 찾아 evidence로 채움. 29,670개 중 10,694개(36%)를 이 방식으로 채웠고, 공유 개체 자체가 없는 나머지 18,976개는 여전히 `unresolved_multihop`로 남음(entity 공존 그래프 최단경로 기준으로도 16,344개는 head-tail을 잇는 개체 사슬 자체가 없어 규칙 기반으로는 원리상 불가 — 3-hop까지 확장하면 2,349개 추가 가능하나 아직 미적용). `resolve_evidence`/`iter_doc_records` 시그니처가 바뀌어 `load_ground_truth.py`/`export_triples.py`도 함께 수정. `load_ground_truth.py` 재실행으로 Neo4j에 실제 반영 완료 — 단, 이 스크립트는 전체 관계 엣지를 지우고(`DELETE r`) 다시 쓰므로 기존 2단계 예측 엣지도 함께 삭제됨 → `load_predictions.py`를 `results/atlop_dream_test_revised_triples_v3_evidence_filled.json`으로 재실행해 복구(이 파일은 이미 evidence가 채워진 사본이라, `load_predictions.py`의 `resolve_pred_evidence`가 재계산 대신 기존 `evidence_source`를 그대로 신뢰하도록 소폭 수정함 — 안 그러면 `inferred_*`였던 것도 전부 `model_provided`로 잘못 뭉개짐). 최종 DB 상태: 노드 45,585 / 엣지 111,945(1단계 103,161 + 2단계 8,784).
+>
+> 2026-07-15: 2단계 구현 — `load_predictions.py` 추가. ATLOP+DREAM 모델이 `test_revised` 문서에서 예측한 triple 8,784개(문서 492개)를 evidence 보완 후 Neo4j에 적재 (`split="test_revised_pred"`, `is_revised=False`). 기존 그래프는 삭제하지 않고 위에 얹는 방식. evidence가 비어있던 2,910개는 원본 문서의 mention 위치로 추론해서 채움 (동일 문장 공존 1,200개 `inferred_cooccurrence`, multi-hop 1,710개는 head/tail 언급 문장 합집합 `inferred_mention_union`). 채운 결과 JSON은 `results/atlop_dream_test_revised_triples_v3_evidence_filled.json`.
+>
+> 2026-07-15: `upsert_pinecone.py`가 대상 Pinecone 인덱스(`informationrag`)의 기존 차원(현재 512)을 `describe_index`로 조회해서 그 차원으로 임베딩하도록 수정 — 인덱스가 이미 다른 차원으로 만들어져 있으면 기본값(1536)으로 임베딩할 때 `Vector dimension ... does not match` 에러가 났던 문제 수정.
 >
 > 2026-07-15: 1단계 대상을 원본 DocRED(`train_annotated`+`dev`)에서 Re-DocRED 재정제본(`train_revised`+`dev_revised`)으로 완전 교체 — 같은 3,053개 문서에 대한 상위호환 라벨(오라벨 정리 + 누락 관계 보강)이라, 원본과 병행 적재하면 revised가 지운 오라벨이 그래프에 남는 문제가 있어 교체를 택함. 모든 엣지에 `is_revised` 속성 추가(`split`이 `_revised`로 끝나면 True — 향후 2단계 모델 예측 triple은 자연히 False). `export_csv.py`/`export_pinecone.py`/`export_postgres.py`도 `is_revised` 컬럼/필드 반영.
 >
@@ -18,7 +22,7 @@
 `export_triples.py`, `load_ground_truth.py`, `export_pinecone.py`, `export_postgres.py`가 공유하는 DocRED 로딩/정규화/evidence 보완 로직:
 
 - `cluster_canonical(cluster)`: 멘션 클러스터의 대표 이름/타입 (최빈값).
-- `resolve_evidence(label, mention_sents_h, mention_sents_t, sents)`: evidence 보완. DocRED 원본 라벨 중 evidence가 비어있는 경우(train_annotated 1,421개/38,180개, dev 487개/12,275개), head/tail이 같은 문장에 함께 언급되면 그 문장을 추론해서 채우고(`inferred_cooccurrence`, 총 515개), 함께 언급되는 문장이 아예 없으면(multi-hop 추론 필요, 총 1,393개) 억지로 채우지 않고 `unresolved_multihop`로 표시.
+- `resolve_evidence(label, h_idx, t_idx, mention_sents, sent_entities, sents)`: evidence 보완, 3단계. train_revised+dev_revised 기준(총 라벨 103,216개): 1) `annotated`(원래 있던 evidence) 54,733개, 2) head/tail이 같은 문장에 공존하면 그 문장(`inferred_cooccurrence`) 18,813개, 3) 공존 문장이 없으면(multi-hop) head 문장·tail 문장을 잇는 공유 개체가 있는 문장 쌍을 찾아 채움(`inferred_bridge`, `find_bridge_sentences`) 10,694개 — 그마저 없으면(공유 개체 자체가 없음) 억지로 채우지 않고 `unresolved_multihop`로 표시 18,976개.
 
 ### 그래프 스키마
 
@@ -42,6 +46,7 @@ python Scripts/kg/load_ground_truth.py              # 실제 Neo4j Aura 적재 (
 |---|---|
 | 고유 개체 노드 | 42,456 (PER 9,846 / LOC 9,566 / MISC 9,151 / ORG 7,357 / TIME 4,770 / NUM 1,766) |
 | 관계 엣지 (문서별 비병합, Neo4j 실제 저장 기준) | 103,161 (96개 관계 타입) — 원본 라벨 수는 103,216인데, 같은 문서 내에서 (head_id, tail_id, relation_type)이 겹치는 MERGE 충돌로 55개가 합쳐짐 |
+| evidence_source 분포 (bridging 추가 후, 2026-07-15 재적재) | `annotated` 54,689 / `inferred_cooccurrence` 18,811 / `inferred_bridge` 10,694 / `unresolved_multihop` 18,967 |
 
 원본(`train_annotated`+`dev`, 2026-07-14 실행) 대비 엣지가 50,286 → 103,161로 약 2배 늘어남 — Re-DocRED가 원본 DocRED의 누락된 관계(false negative)를 대거 보강한 결과.
 
@@ -59,8 +64,27 @@ Neo4j 그래프를 그대로 다른 시스템에 옮겨 쓸 수 있도록 내보
 | `upsert_pinecone.py` | Pinecone 인덱스(`informationrag`) | `pinecone_upsert.jsonl`을 읽어 OpenAI `text-embedding-3-small`로 `text`를 임베딩하고 Pinecone에 업서트. 인덱스가 없으면 서버리스로 자동 생성, 있으면 기존 차원에 맞춰 임베딩. |
 | `export_postgres.py` | `schema.sql`, `entities.csv`, `relations.csv` | PostgreSQL(Supabase)용. `entities`/`relations` 2개 테이블, `relations.head_id`/`tail_id`가 `entities.id`를 참조하는 FK. `aliases`/`sentence_id`/`evidence`는 JSONB. Supabase SQL Editor에서 `schema.sql` 실행 후 Table Editor로 CSV 임포트(entities 먼저), 또는 `psql`의 `\copy`. |
 
+## 2단계: 모델 예측 triple 적재 (`load_predictions.py`)
+
+- **대상**: ATLOP+DREAM 모델이 `test_revised`(1단계 미포함 문서)에서 예측한 triple JSON (예: `atlop_dream_revised_test_revised_triples_v3.json`). 1단계 그래프를 삭제하지 않고 그 위에 얹음.
+- **개체 병합**: 예측 파일의 entity id(`E0` 등)는 문서 내 vertexSet 인덱스이므로, 해당 클러스터의 canonical 이름/타입으로 `global_entity_id`를 만들어 1단계 노드와 그대로 병합 (예측 파일의 `name` 필드는 별칭일 수 있어 직접 쓰지 않음).
+- **evidence 보완**: 파일에 evidence가 있으면 `model_provided`, 없으면 head/tail 동일 문장 공존 시 그 문장(`inferred_cooccurrence`), multi-hop이면 head/tail 언급 문장 합집합(`inferred_mention_union`)으로 채움. `--write-filled <경로>`로 채운 JSON 사본 저장 가능.
+- **엣지 스키마**: 1단계와 동일 + `model`("atlop_dream"), `filter_band`, `filter_action` 추가. `confidence`는 모델 예측값, `split="test_revised_pred"`(`_revised`로 안 끝나므로 `is_revised=False`).
+
+```
+python Scripts/kg/load_predictions.py <예측 JSON 경로> --dry-run   # 집계만 확인
+python Scripts/kg/load_predictions.py <예측 JSON 경로>             # 실제 적재
+```
+
+### 적재 결과 (2026-07-15 실제 적재 기준, v3 예측 파일)
+
+| 항목 | 개수 |
+|---|---|
+| 예측 triple 엣지 | 8,784 (86개 관계 타입, 문서 492개) |
+| evidence 출처 | model_provided 5,874 / inferred_cooccurrence 1,200 / inferred_mention_union 1,710 |
+| 개체 노드 | 4,267개 대상 중 3,129개 신규 생성, 1,138개는 1단계 기존 노드에 병합 (전체 노드 42,456 → 45,585) |
+
 ## 다음 단계 (미구현)
 
-- 2단계: 모델이 예측한 (미검증) triple을 낮은 confidence로 적재 — 향후 작업.
 - Neo4j Bloom 시각화 씬 구성 (`README.md`의 5.2절 참고).
 - LangGraph 쪽에서 confidence를 가드레일로 쓰는 로직 (예: 임계값 미만이면 답변에서 제외/재확인 요청) — 이 저장소 범위 밖, LangGraph 프로젝트에서 구현.
