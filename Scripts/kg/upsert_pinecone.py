@@ -1,17 +1,15 @@
-"""`pinecone_upsert.jsonl`(export_pinecone.py 산출물)을 OpenAI로 임베딩해서
-Pinecone 인덱스에 업서트한다.
+"""pinecone_upsert.jsonl의 {id, text, metadata}를 OpenAI 임베딩으로 벡터화해
+Pinecone 인덱스에 upsert한다.
+
+사전 준비:
+    .env 에 아래 두 줄 추가
+        OPENAI_API_KEY=...
+        PINECONE_API_KEY=...
 
 사용법:
-    python Scripts/kg/upsert_pinecone.py                # 전체 업서트
-    python Scripts/kg/upsert_pinecone.py --limit 50      # 앞 50개만 (테스트용)
-    python Scripts/kg/upsert_pinecone.py --dry-run       # API 호출 없이 건수/토큰만 확인
-
-필요 환경변수 (`.env`): OPENAI_API_KEY, PINECONE_API_KEY, PINECONE_INDEX_NAME.
-선택: PINECONE_CLOUD(기본 aws), PINECONE_REGION(기본 us-east-1) — 인덱스가
-아직 없을 때 생성할 서버리스 인덱스의 위치.
+    python Scripts/kg/upsert_pinecone.py
 """
 
-import argparse
 import json
 import os
 import time
@@ -20,112 +18,72 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent.parent.parent
-DEFAULT_INPUT = ROOT / "pinecone_upsert.jsonl"
+JSONL_PATH = ROOT / "pinecone_upsert.jsonl"
 
+INDEX_NAME = "informationrag"
 EMBED_MODEL = "text-embedding-3-small"
 EMBED_DIM = 1536
+BATCH_SIZE = 100
 
 
-def read_rows(path, limit=None):
-    rows = []
-    with open(path, encoding="utf-8") as f:
+def load_rows():
+    with open(JSONL_PATH, "r", encoding="utf-8") as f:
         for line in f:
-            rows.append(json.loads(line))
-            if limit and len(rows) >= limit:
-                break
-    return rows
+            yield json.loads(line)
 
 
-def chunked(items, size):
-    for i in range(0, len(items), size):
-        yield items[i : i + size]
-
-
-def embed_batch(client, texts, dimensions, retries=3):
-    for attempt in range(retries):
-        try:
-            resp = client.embeddings.create(
-                model=EMBED_MODEL, input=texts, dimensions=dimensions
-            )
-            return [d.embedding for d in resp.data]
-        except Exception as e:
-            if attempt == retries - 1:
-                raise
-            wait = 2**attempt
-            print(f"  임베딩 실패 ({e}), {wait}초 후 재시도")
-            time.sleep(wait)
-
-
-def upsert_batch(index, vectors, retries=3):
-    for attempt in range(retries):
-        try:
-            index.upsert(vectors=vectors)
-            return
-        except Exception as e:
-            if attempt == retries - 1:
-                raise
-            wait = 2**attempt
-            print(f"  업서트 실패 ({e}), {wait}초 후 재시도")
-            time.sleep(wait)
+def batched(iterable, size):
+    batch = []
+    for item in iterable:
+        batch.append(item)
+        if len(batch) == size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
-    parser.add_argument("--batch-size", type=int, default=100)
-    parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--dry-run", action="store_true")
-    args = parser.parse_args()
-
-    load_dotenv(ROOT / ".env")
-
-    rows = read_rows(args.input, args.limit)
-    print(f"{args.input.name}: {len(rows)}개 로드")
-
-    if args.dry_run:
-        approx_tokens = sum(len(r["text"]) for r in rows) // 4
-        print(f"[dry-run] 임베딩/업서트를 실제로 호출하지 않음. 예상 토큰 수(대략): {approx_tokens:,}")
-        return
-
     from openai import OpenAI
     from pinecone import Pinecone, ServerlessSpec
 
+    load_dotenv(ROOT / ".env")
     openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-
     pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
-    index_name = os.environ["PINECONE_INDEX_NAME"]
 
-    if index_name not in pc.list_indexes().names():
-        print(f"Pinecone 인덱스 '{index_name}' 없음 -> 생성")
+    if INDEX_NAME not in [idx["name"] for idx in pc.list_indexes()]:
         pc.create_index(
-            name=index_name,
+            name=INDEX_NAME,
             dimension=EMBED_DIM,
             metric="cosine",
-            spec=ServerlessSpec(
-                cloud=os.environ.get("PINECONE_CLOUD", "aws"),
-                region=os.environ.get("PINECONE_REGION", "us-east-1"),
-            ),
+            spec=ServerlessSpec(cloud="aws", region="us-east-1"),
         )
-        while not pc.describe_index(index_name).status["ready"]:
+        while not pc.describe_index(INDEX_NAME).status["ready"]:
             time.sleep(1)
 
-    dimensions = pc.describe_index(index_name).dimension
-    print(f"인덱스 '{index_name}' 차원: {dimensions}")
-    index = pc.Index(index_name)
+    # 인덱스가 이미 존재하면 그 차원에 맞춰 임베딩해야 함 (다른 값으로 만들어져 있을 수 있음)
+    dimensions = pc.describe_index(INDEX_NAME).dimension
+    index = pc.Index(INDEX_NAME)
 
     n = 0
-    for batch in chunked(rows, args.batch_size):
-        texts = [r["text"] for r in batch]
-        embeddings = embed_batch(openai_client, texts, dimensions)
+    for batch in batched(load_rows(), BATCH_SIZE):
+        texts = [row["text"] for row in batch]
+        resp = openai_client.embeddings.create(
+            model=EMBED_MODEL, input=texts, dimensions=dimensions
+        )
         vectors = [
-            {"id": r["id"], "values": emb, "metadata": r["metadata"]}
-            for r, emb in zip(batch, embeddings)
+            {
+                "id": row["id"],
+                "values": emb.embedding,
+                "metadata": row["metadata"],
+            }
+            for row, emb in zip(batch, resp.data)
         ]
-        upsert_batch(index, vectors)
-        n += len(batch)
-        print(f"  {n}/{len(rows)} 업서트 완료")
+        index.upsert(vectors=vectors)
+        n += len(vectors)
+        print(f"upserted {n}")
 
-    print(f"완료: {n}개를 '{index_name}' 인덱스에 업서트")
+    print(f"done: {n}개 벡터를 '{INDEX_NAME}' 인덱스에 upsert")
 
 
 if __name__ == "__main__":

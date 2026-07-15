@@ -1,4 +1,17 @@
-"""1단계: train_annotated + dev의 사람 annotate 정답 triple을 Neo4j에 적재.
+"""1단계: train_revised + dev_revised(Re-DocRED 재정제본)의 사람 검증 정답
+triple을 Neo4j에 적재.
+
+원래는 원본 DocRED의 train_annotated + dev를 썼으나, Re-DocRED가 같은 3,053개
+문서에 대해 누락된 관계를 보강하고 오라벨을 정리한 상위호환 재정제본을 내놓으면서
+이걸로 완전히 교체함 (둘을 같이 적재하면 revised가 지운 오라벨이 그래프에
+남는 문제가 있어 병행 적재 대신 교체를 택함). dev는 998개 문서에서 500개로
+줄어드는 대신(나머지 498개는 test_revised로 분리됨, 이번 적재 대상 아님)
+문서당 관계 밀도는 원본보다 훨씬 높아짐.
+
+각 엣지는 `is_revised` 속성을 갖는다 (split이 `_revised`로 끝나면 True —
+docred_common.is_revised_split 참고). 지금은 SPLITS 전부가 revised라 항상
+True지만, 향후 2단계(모델 예측 triple, 낮은 confidence)가 추가되면 그쪽은
+False로 자연히 구분됨.
 
 개체 노드는 (정규화된 이름, type) 기준으로 문서 간 전역 병합한다 (DocRED는 문서 간
 entity linking을 제공하지 않으므로, 동일 표기+동일 type을 같은 개체로 취급하는
@@ -35,12 +48,13 @@ from dotenv import load_dotenv
 from docred_common import (
     ROOT,
     global_entity_id,
+    is_revised_split,
     iter_doc_records,
     load_rel_info,
     resolve_evidence,
 )
 
-SPLITS = ["train_annotated", "dev"]
+SPLITS = ["train_revised", "dev_revised"]
 BATCH_SIZE = 500
 ENTITY_LABEL = "ZEntity"
 
@@ -92,6 +106,7 @@ def build_graph(splits, rel_info):
                     "sentence_id": evidence_sent_ids,
                     "evidence": evidence_texts,
                     "evidence_source": evidence_source,
+                    "is_revised": is_revised_split(split),
                 }
             )
 
@@ -159,7 +174,8 @@ SET
     r.split = row.split,
     r.sentence_id = row.sentence_id,
     r.evidence = row.evidence,
-    r.evidence_source = row.evidence_source
+    r.evidence_source = row.evidence_source,
+    r.is_revised = row.is_revised
 """
 
 

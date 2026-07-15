@@ -52,7 +52,8 @@ def main():
         r.relation_id AS relation_id, r.relation_name AS relation_name,
         t.id AS tail_id, t.name AS tail_name, t.type AS tail_type,
         r.confidence AS confidence, r.split AS split, r.document AS document,
-        r.sentence_id AS sentence_id, r.evidence AS evidence, r.evidence_source AS evidence_source
+        r.sentence_id AS sentence_id, r.evidence AS evidence, r.evidence_source AS evidence_source,
+        r.is_revised AS is_revised
     """
 
     n = 0
@@ -88,6 +89,7 @@ def main():
                         "document": record["document"],
                         "sentence_id": [str(s) for s in record["sentence_id"]],
                         "evidence_source": record["evidence_source"],
+                        "is_revised": record["is_revised"],
                     },
                 }
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
