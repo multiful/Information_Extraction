@@ -46,3 +46,6 @@ docred_data/data/_fact_cache/
 
 # 로컬 스크래치 노트북 (커밋 안 함)
 ffy.ipynb
+
+# GraphRAG 고도화 실험용 LLM 응답 캐시 (재생성 가능)
+GraphRAG/.cache/
