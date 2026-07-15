@@ -1,6 +1,19 @@
 # dk EGAT 모델 — 제안 아키텍처 파이프라인 문서
 
-> **최종 업데이트**: 2026-07-15 (**PUATLoss(0.7) revised 데이터셋 실측 결과 확정(baseline보다
+> **최종 업데이트**: 2026-07-15 (**🏁 dk_gat 트랙 종료 — plain ATLOP baseline 채택, 팀은
+> 도현님 모델 사용**): `colab_gat_a100.ipynb`에서 revised 데이터셋 기준 3개 조합을 실측
+> 비교 완료 — plain ATLOP baseline(`atlop_baseline_revised`) dev F1 73.67/Ign F1 72.95(**채택**),
+> + PUATLoss(0.7)(`atlop_pu07_revised`) 73.30/72.20(baseline보다 낮음), + Entity-Pair
+> Graph(`dk_gat_pairgraph_revised`) 71.95/71.05(baseline보다 더 낮음). 두 개선 시도 모두
+> baseline을 못 넘김 — PU loss는 이 데이터셋 노이즈(positive 라벨 과다추정)가
+> na_weight=0.7이 겨냥하는 메커니즘(distant Na 라벨 노이즈)과 안 맞아서, Entity-Pair
+> Graph는 원본 데이터셋에서 시도했던 다른 GAT 조합들(heterogeneous-graph-only, Gated
+> Fusion+Bilinear)과 같은 패턴(baseline 미달)으로 재확인됨 — **그래프 증강이 이 프로젝트
+> 에서 3전 3패**. 팀은 도현님이 만든 모델을 최종으로 사용하기로 하여, 이 dk_gat 트랙은
+> plain ATLOP baseline(revised, 73.67/72.95) 기록을 끝으로 종료 — 추가 실험 없음. 상세
+> 로그/근거는 `colab_gat_a100.ipynb`의 "결과 기록" 셀 참고.
+>
+> 이전 (**PUATLoss(0.7) revised 데이터셋 실측 결과 확정(baseline보다
 > 낮음, 채택 안 함) — Entity-Pair Graph 단독 실험으로 전환**): `atlop_pu07_revised` 실행이
 > 완료됨 — `--early_stop_patience 5`가 실제로 발동해 epoch 13에서 조기 종료(best epoch 8).
 > best 체크포인트 기준 dev F1 73.30/Ign F1 72.20, test(best ckpt) F1 73.67/Ign F1 72.60 —
