@@ -51,6 +51,7 @@ except Exception:
 # 상대 import를 쓰므로 -- `from cache import ...` -- sys.path에 폴더 자체를 넣어야 함)
 sys.path.insert(0, str(ROOT / "GraphRAG"))
 import graphrag_query as gq  # noqa: E402  (sys.path 조작 이후에 import해야 함)
+from cache import cache_key, cached  # noqa: E402
 
 CHAT_MODEL = gq.CHAT_MODEL
 MAX_QUERY_CHARS = 600
@@ -68,6 +69,17 @@ ROUTE_LABELS_KO = {
     "property_scan": "②' 속성 전역 스캔",
     "bfs": "③ 멀티홉 BFS",
     "no_seed": "매칭된 엔티티 없음",
+}
+
+# 위 ROUTE_LABELS_KO는 기술 상세용(라우팅 로직을 정확히 감사하려는 사용자용) --
+# 일반 사용자에게 보여주는 요약 문장에는 이 쉬운 설명을 대신 쓴다(2026-07-16,
+# "너무 어렵고 난해하다"는 피드백으로 추가).
+ROUTE_PLAIN_KO = {
+    "1hop": "바로 연결된 정보에서 찾았어요",
+    "1hop_fallback_bfs": "바로 연결된 정보엔 없어서, 몇 단계를 더 건너가며 찾았어요",
+    "property_scan": "조건에 맞는 대상을 그래프 전체에서 찾았어요",
+    "bfs": "여러 단계를 거쳐 연결된 정보까지 넓게 찾았어요",
+    "no_seed": "질문에 맞는 대상을 찾지 못했어요",
 }
 
 TYPE_COLORS = {
@@ -247,17 +259,24 @@ def run_graphrag_analysis(question):
 def translate_to_english(question):
     """색인된 본문이 전부 영어라(RAG/load_naive_rag.py), 벡터 검색 전에 질문을
     영어로 번역한다 -- RAG/demo_compare.py가 이미 확립한 방식(같은 언어끼리
-    검색해야 벡터 유사도가 잘 나옴)."""
-    resp = gq.openai_client.chat.completions.create(
-        model=CHAT_MODEL,
-        messages=[{
-            "role": "user",
-            "content": f"다음 한국어 질문을 자연스러운 영어 질문 한 문장으로만 번역하세요 "
-                       f"(다른 설명 없이 번역문만):\n{question}",
-        }],
-        temperature=0,
-    )
-    return resp.choices[0].message.content.strip()
+    검색해야 벡터 유사도가 잘 나옴).
+
+    graphrag_query.py의 cached()로 감쌈 -- temperature=0이라 같은 질문은 항상
+    같은 번역이 나오는데, 이 파일만 그 캐싱 관례를 안 따르고 있었음(2026-07-16,
+    감사에서 발견). 추천 질문 칩을 데모 중 다시 눌러도 API를 또 부르지 않는다."""
+    def compute():
+        resp = gq.openai_client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[{
+                "role": "user",
+                "content": f"다음 한국어 질문을 자연스러운 영어 질문 한 문장으로만 번역하세요 "
+                           f"(다른 설명 없이 번역문만):\n{question}",
+            }],
+            temperature=0,
+        )
+        return resp.choices[0].message.content.strip()
+
+    return cached(cache_key("st_translate_to_english", CHAT_MODEL, question), compute)
 
 
 def run_naive_rag_analysis(question):
@@ -283,20 +302,27 @@ def run_naive_rag_analysis(question):
     ]
 
     context_block = "\n".join(f"- [{c['title']}] {c['text']}" for c in chunks) if chunks else "(검색 결과 없음)"
-    prompt = (
-        "아래 컨텍스트만 근거로 질문에 한국어로 답하세요. 컨텍스트에 답이 없거나 "
-        "근거가 불충분하면 반드시 '모름'이라고만 답하세요.\n\n"
-        f"컨텍스트:\n{context_block}\n\n질문: {question}"
-    )
-    answer_resp = gq.openai_client.chat.completions.create(
-        model=CHAT_MODEL, messages=[{"role": "user", "content": prompt}], temperature=0,
-    )
+
+    def compute_answer():
+        prompt = (
+            "아래 컨텍스트만 근거로 질문에 한국어로 답하세요. 컨텍스트에 답이 없거나 "
+            "근거가 불충분하면 반드시 '모름'이라고만 답하세요.\n\n"
+            f"컨텍스트:\n{context_block}\n\n질문: {question}"
+        )
+        resp = gq.openai_client.chat.completions.create(
+            model=CHAT_MODEL, messages=[{"role": "user", "content": prompt}], temperature=0,
+        )
+        return resp.choices[0].message.content.strip()
+
+    # translate_to_english()와 같은 이유로 캐싱 -- context_block을 키에 포함시켜
+    # (질문은 같아도) 검색된 청크가 바뀌면 캐시를 새로 씀.
+    answer = cached(cache_key("st_naive_rag_answer", CHAT_MODEL, question, context_block), compute_answer)
 
     return {
         "question": question,
         "query_en": query_en,
         "chunks": chunks,
-        "answer": answer_resp.choices[0].message.content.strip(),
+        "answer": answer,
     }
 
 
@@ -307,7 +333,12 @@ def run_naive_rag_analysis(question):
 def build_graph_html(nodes, edges, seed_names):
     net = Network(
         height="440px", width="100%", bgcolor="#131c11", font_color="#eee8d8",
-        directed=True, cdn_resources="remote",
+        directed=True,
+        # "remote"였던 걸 "in_line"으로 -- vis-network.js를 생성된 HTML 안에 그대로
+        # 박아 넣어서 CDN 접속이 필요 없다. 이 앱은 교수/평가자 앞 발표에서 쓰이는데
+        # (PRODUCT.md), 발표 장소 네트워크가 CDN을 막거나 느리면 그래프 패널 전체가
+        # 조용히 안 뜨는 위험이 있었음(2026-07-16, 감사에서 발견).
+        cdn_resources="in_line",
     )
     net.barnes_hut(gravity=-3500, central_gravity=0.25, spring_length=130, spring_strength=0.02)
 
@@ -339,7 +370,33 @@ def build_graph_html(nodes, edges, seed_names):
             arrows="to",
         )
 
-    return net.generate_html(notebook=False)
+    html = net.generate_html(notebook=False)
+    # pyvis 기본 동작은 그래프가 다 안정된(stabilized) 뒤에도 barnes_hut 물리
+    # 시뮬레이션을 끄지 않고 계속 돌린다 -- 화면이 이미 멈춰 보여도 탭이 열려있는
+    # 동안 CPU를 계속 씀(2026-07-16, 감사에서 발견). pyvis는 이 이벤트에 파이썬
+    # API가 없어서, 생성된 HTML에 vis-network의 stabilizationIterationsDone
+    # 이벤트를 직접 붙이는 스크립트를 덧붙인다 (템플릿의 전역 `network` 변수를 그대로 씀).
+    html = html.replace(
+        "</body>",
+        "<script>"
+        "(function(){"
+        "var n=0;"
+        "var t=setInterval(function(){"
+        "n++;"
+        "if (typeof network !== 'undefined') {"
+        "clearInterval(t);"
+        "network.once('stabilizationIterationsDone', function(){ network.setOptions({physics:false}); });"
+        # pyvis 내부 변수명이 언젠가 바뀌거나 스크립트 에러로 network가 끝까지
+        # 안 잡히는 경우까지 대비해 10초(100회) 뒤엔 그냥 포기하고 멈춤
+        # (재감사에서 발견 -- 원래는 못 찾으면 무한 폴링).
+        "} else if (n > 100) {"
+        "clearInterval(t);"
+        "}"
+        "}, 100);"
+        "})();"
+        "</script></body>",
+    )
+    return html
 
 
 # ---------------------------------------------------------------------------
@@ -350,147 +407,233 @@ def inject_css():
     st.markdown(
         """
         <style>
+        /* 디자인 토큰 -- amber 강조색 하나가 12곳 넘게 하드코딩돼 있던 것을
+        비롯해 색이 전부 리터럴로 흩어져 있던 문제를 정리(2026-07-16, 감사에서
+        발견). 값 자체는 전부 기존 그대로이고(팔레트 변경 아님), 같은 값을 쓰던
+        곳을 변수 하나로 묶었을 뿐. TYPE_COLORS(엔티티 타입 색)는 pyvis 그래프에
+        Python에서 인라인 스타일로 직접 넣어야 해서 이 CSS 토큰과는 별개로 유지. */
+        :root {
+            --bg-grad-start: #12190f;
+            --bg-grad-end: #161f13;
+            --surface-panel: #1a2417;
+            --surface-sunken: #171f14;
+            --surface-tag: #2a3524;
+            --surface-card: #efe8d5;
+            --surface-input: #f8f5ec;
+            --border: #33402c;
+            --border-input: #cfc6a8;
+
+            --text: #eee8d8;
+            --text-bright: #f3efe1;
+            --text-label: #b7c2a8;
+            --text-muted: #9aa38f;
+            --text-soft: #a9b39c;
+            --text-dim: #6b7362;
+            --text-body: #cdd5c1;
+            --text-on-accent: #1c2418;
+
+            --accent: #d9a441;
+            --accent-hover: #e8b658;
+            --accent-chosen-bg: #24230f;
+            --rag-blue: #7a9cc6;
+            --danger: #e07a5f;
+            --online: #7fbf7f;
+        }
+
         .stApp {
-            background: linear-gradient(180deg, #12190f 0%, #161f13 100%);
-            color: #eee8d8;
+            background: linear-gradient(180deg, var(--bg-grad-start) 0%, var(--bg-grad-end) 100%);
+            color: var(--text);
         }
         [data-testid="stHeader"] { background: transparent; }
-        h1, h2, h3, h4 { color: #f3efe1 !important; }
-        p, span, label, div { color: #eee8d8; }
+        /* !important 제거 -- .section-label/.compare-col-title처럼 이 태그를
+        실제로 쓰는 클래스가 자기 색을 지정할 수 있어야 함(2026-07-16, 감사에서
+        발견: !important가 있으면 heading 태그로 바꾸는 순간 클래스의 muted 색이
+        전부 밝은 색으로 덮여버림). */
+        h1, h2, h3, h4 { color: var(--text-bright); }
+        p, span, label, div { color: var(--text); }
+
+        .sr-only {
+            position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+            overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+        }
 
         .trace-topbar {
-            display: flex; justify-content: space-between; align-items: center;
-            padding: 8px 4px 20px 4px; border-bottom: 1px solid #33402c; margin-bottom: 8px;
+            display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center;
+            padding: 8px 4px 20px 4px; border-bottom: 1px solid var(--border); margin-bottom: 8px;
         }
-        .trace-logo { font-weight: 800; letter-spacing: 2px; font-size: 1.1rem; color: #f3efe1; }
-        .trace-logo .sub { font-weight: 400; color: #9aa38f; font-size: 0.8rem; margin-left: 8px; }
-        .trace-status { font-size: 0.75rem; color: #9aa38f; }
-        .trace-status .dot { color: #7fbf7f; }
+        .trace-logo {
+            margin: 0 !important; font-weight: 800 !important; letter-spacing: 2px !important;
+            font-size: 1.1rem !important; color: var(--text-bright) !important; line-height: 1.4 !important;
+        }
+        .trace-logo .sub { font-weight: 400; color: var(--text-muted); font-size: 0.8rem; margin-left: 8px; }
+        .trace-status { font-size: 0.75rem; color: var(--text-muted); }
+        .trace-status .dot { color: var(--online); }
 
+        /* 값마다 !important -- Streamlit이 markdown 안의 진짜 h1~h4 태그에
+        자체 기본 타이포그래피(큰 폰트 크기 등)를 얹어서, 이 클래스만으로는
+        안 이겨 시각적으로 완전히 달라짐(2026-07-16, div->heading 전환 후
+        실측 발견). 이 파일이 이미 다른 곳(.entity-chip 등)에서 쓰는 것과
+        같은 패턴. */
         .section-label {
-            display: flex; align-items: center; gap: 8px;
-            font-size: 0.78rem; letter-spacing: 1.5px; color: #b7c2a8; text-transform: uppercase;
-            margin-bottom: 6px;
+            display: flex !important; align-items: center; gap: 8px;
+            font-size: 0.78rem !important; font-weight: 400 !important;
+            letter-spacing: 1.5px !important; color: var(--text-label) !important;
+            text-transform: uppercase !important; margin: 0 0 6px 0 !important;
+            line-height: 1.4 !important;
         }
         .badge {
-            background: #d9a441; color: #1c2418; font-weight: 700;
+            background: var(--accent); color: var(--text-on-accent); font-weight: 700;
             border-radius: 4px; padding: 1px 7px; font-size: 0.72rem;
         }
-        .badge.rag { background: #7a9cc6; }
+        .badge.rag { background: var(--rag-blue); }
+        /* route_label 배지 전용 -- 예전엔 .evidence-tag를 재사용하면서 배경만
+        인라인으로 amber로 덮어썼는데, .evidence-tag의 color:var(--text-body) !important가
+        그대로 남아 옅은 크림색 글자가 amber 배경 위에 얹혀 대비 ~1.49:1로 사실상
+        안 읽히는 버그였음(2026-07-16, 감사에서 발견). .vote-tag.chosen처럼 amber
+        배경엔 어두운 글자를 쓰는 전용 클래스로 분리. */
+        .route-badge {
+            display: inline-block; background: var(--accent); color: var(--text-on-accent);
+            font-weight: 700; border-radius: 4px; padding: 1px 7px; font-size: 0.72rem;
+        }
 
-        .hero-title { font-size: 2.4rem; line-height: 1.25; font-weight: 700; color: #f3efe1; margin: 4px 0 10px 0; }
-        .hero-title .accent { color: #d9a441; border-bottom: 3px solid #d9a441; }
-        .hero-sub { color: #a9b39c; font-size: 0.95rem; max-width: 560px; }
+        .hero-title { font-size: 2.4rem; line-height: 1.25; font-weight: 700; color: var(--text-bright); margin: 4px 0 10px 0; }
+        .hero-title .accent { color: inherit; }
+        .hero-sub { color: var(--text-soft); font-size: 0.95rem; max-width: 620px; }
 
         .pipeline-box { font-size: 0.85rem; }
-        .pipeline-item { display: flex; gap: 8px; padding: 4px 0; color: #cdd5c1; }
-        .pipeline-item .n { color: #d9a441; font-weight: 700; }
+        .pipeline-item { display: flex; gap: 8px; padding: 4px 0; color: var(--text-body); }
+        .pipeline-item .n { color: var(--accent); font-weight: 700; }
 
         .card-cream {
-            background: #efe8d5; color: #1c2418; border-radius: 12px;
+            background: var(--surface-card); color: var(--text-on-accent); border-radius: 12px;
             padding: 22px 26px; margin: 10px 0 18px 0;
         }
-        .card-cream * { color: #1c2418; }
-        .muted { color: #6b7362 !important; font-size: 0.8rem; }
+        .card-cream * { color: var(--text-on-accent); }
+        .muted { color: var(--text-dim) !important; font-size: 0.8rem; }
 
         .stat-row {
-            display: flex; gap: 0; border: 1px solid #33402c; border-radius: 10px;
+            display: flex; flex-wrap: wrap; gap: 0; border: 1px solid var(--border); border-radius: 10px;
             overflow: hidden; margin-bottom: 18px;
         }
         .stat-cell {
-            flex: 1; padding: 14px 18px; border-right: 1px solid #33402c;
+            flex: 1 1 140px; padding: 14px 18px; border-right: 1px solid var(--border);
         }
         .stat-cell:last-child { border-right: none; }
-        .stat-cell .label { font-size: 0.72rem; color: #9aa38f; text-transform: uppercase; letter-spacing: 1px; }
-        .stat-cell .value { font-size: 1.6rem; font-weight: 700; color: #f3efe1; }
-        .stat-cell .value .unit { font-size: 0.85rem; color: #9aa38f; font-weight: 400; margin-left: 4px; }
+        /* 좁은 화면(발표용 데스크톱이 주 대상이지만, 창을 작게 띄우거나 노트북
+        화면에서 보는 경우까지 감안)에서는 3칸이 한 줄에 다 안 들어가면 라벨이
+        구겨지는 대신 세로로 쌓이게 함(2026-07-16, 감사에서 발견). */
+        @media (max-width: 640px) {
+            .stat-cell { flex: 1 1 100%; border-right: none; border-bottom: 1px solid var(--border); }
+            .stat-cell:last-child { border-bottom: none; }
+        }
+        .stat-cell .label { font-size: 0.72rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px; }
+        .stat-cell .value { font-size: 1.6rem; font-weight: 700; color: var(--text-bright); }
+        .stat-cell .value .unit { font-size: 0.85rem; color: var(--text-muted); font-weight: 400; margin-left: 4px; }
 
         .panel {
-            background: #1a2417; border: 1px solid #33402c; border-radius: 12px;
+            background: var(--surface-panel); border: 1px solid var(--border); border-radius: 12px;
             padding: 18px 20px; margin-bottom: 16px; height: 100%;
         }
         .panel * { color: inherit; }
 
         .entity-chip {
-            display: inline-block; background: #d9a441; color: #1c2418 !important;
+            display: inline-block; background: var(--accent); color: var(--text-on-accent) !important;
             font-weight: 700; font-size: 0.7rem; border-radius: 4px; padding: 2px 7px; margin-right: 8px;
         }
-        .entity-item { padding: 10px 0; border-bottom: 1px solid #2a3524; }
+        .entity-item { padding: 10px 0; border-bottom: 1px solid var(--surface-tag); }
         .entity-item:last-child { border-bottom: none; }
-        .entity-name { font-weight: 700; color: #f3efe1; }
-        .entity-quote { font-size: 0.78rem; color: #9aa38f; }
+        .entity-name { font-weight: 700; color: var(--text-bright); }
+        .entity-quote { font-size: 0.78rem; color: var(--text-muted); }
 
-        .step-item { display: flex; gap: 10px; padding: 8px 0; font-size: 0.85rem; color: #cdd5c1; }
-        .step-num { color: #d9a441; font-weight: 700; min-width: 18px; }
+        .step-item { display: flex; gap: 10px; padding: 8px 0; font-size: 0.85rem; color: var(--text-body); }
+        .step-num { color: var(--accent); font-weight: 700; min-width: 18px; }
 
         .evidence-item {
-            border: 1px solid #33402c; border-radius: 10px; padding: 14px 18px; margin-bottom: 10px;
-            background: #171f14;
+            border: 1px solid var(--border); border-radius: 10px; padding: 14px 18px; margin-bottom: 10px;
+            background: var(--surface-sunken);
         }
-        .evidence-id { color: #d9a441; font-weight: 700; font-size: 0.75rem; }
-        .evidence-triple { font-weight: 700; color: #f3efe1; margin: 4px 0; }
-        .evidence-quote { color: #a9b39c; font-size: 0.82rem; font-style: italic; }
+        .evidence-id { color: var(--accent); font-weight: 700; font-size: 0.75rem; }
+        .evidence-triple { font-weight: 700; color: var(--text-bright); margin: 4px 0; }
+        .evidence-quote { color: var(--text-soft); font-size: 0.82rem; font-style: italic; }
         .evidence-tag {
-            display: inline-block; background: #2a3524; color: #cdd5c1 !important;
+            display: inline-block; background: var(--surface-tag); color: var(--text-body) !important;
             font-size: 0.68rem; border-radius: 4px; padding: 2px 7px; margin-top: 6px; margin-right: 6px;
         }
 
         .vote-item {
-            border: 1px solid #33402c; border-radius: 8px; padding: 10px 14px; margin-bottom: 6px;
-            font-size: 0.82rem; background: #171f14;
+            border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; margin-bottom: 6px;
+            font-size: 0.82rem; background: var(--surface-sunken);
         }
-        .vote-item.chosen { border-color: #d9a441; background: #24230f; }
+        .vote-item.chosen { border-color: var(--accent); background: var(--accent-chosen-bg); }
         .vote-tag {
             display: inline-block; font-size: 0.65rem; font-weight: 700; border-radius: 4px;
             padding: 1px 6px; margin-bottom: 4px;
         }
-        .vote-tag.chosen { background: #d9a441; color: #1c2418; }
-        .vote-tag.other { background: #33402c; color: #cdd5c1; }
+        .vote-tag.chosen { background: var(--accent); color: var(--text-on-accent); }
+        .vote-tag.other { background: var(--border); color: var(--text-body); }
+
+        /* st.error()의 기본 빨간 배너는 이 페이지 어디에도 없는 스타일이라, 뭔가
+        잘못됐을 때(데모 중 가장 안 좋은 타이밍)만 테마와 안 맞는 화면이 튀어나옴
+        (2026-07-16, 감사에서 발견). 나머지 카드와 같은 어휘(전체 테두리 색으로
+        상태 표시, .vote-item.chosen과 동일한 패턴)로 대체. */
+        .error-card {
+            background: var(--surface-sunken); border: 1px solid var(--danger); border-radius: 10px;
+            padding: 16px 20px; margin-bottom: 16px;
+        }
+        .error-card .title { color: var(--danger); font-weight: 700; font-size: 0.85rem; margin-bottom: 4px; }
+        .error-card .body { color: var(--text); font-size: 0.9rem; }
 
         .compare-col-title {
-            font-weight: 800; font-size: 1rem; letter-spacing: 1px; margin-bottom: 10px;
-            display: flex; align-items: center; gap: 8px;
+            font-weight: 800 !important; font-size: 1rem !important; letter-spacing: 1px !important;
+            color: var(--text) !important; margin: 0 0 10px 0 !important; line-height: 1.4 !important;
+            display: flex !important; align-items: center; gap: 8px;
         }
 
         /* st.container(key=...)가 생성하는 wrapper(stVerticalBlock 자체)에 카드 스타일 적용 */
         div.st-key-query_console {
-            background: #efe8d5; border-radius: 12px; padding: 22px 26px 14px 26px; margin: 10px 0 18px 0;
+            background: var(--surface-card); border-radius: 12px; padding: 22px 26px 14px 26px; margin: 10px 0 18px 0;
             gap: 0.6rem !important;
         }
         div.st-key-query_console textarea {
-            background: #f8f5ec !important; color: #1c2418 !important; border: 1px solid #cfc6a8 !important;
+            background: var(--surface-input) !important; color: var(--text-on-accent) !important;
+            border: 1px solid var(--border-input) !important;
         }
-        div.st-key-query_console p { color: #6b7362 !important; margin: 0 !important; }
+        div.st-key-query_console p { color: var(--text-dim) !important; margin: 0 !important; }
         div.st-key-chip_row button {
-            background: transparent !important; color: #eee8d8 !important; border: 1px solid #4a5842 !important;
+            background: transparent !important; color: var(--text-soft) !important; border: none !important;
             font-weight: 500; font-size: 0.78rem; white-space: normal; text-align: left !important;
-            justify-content: flex-start !important; margin-bottom: 6px;
+            justify-content: flex-start !important;
+            /* 4px -> 10px: 실제 탭 가능 높이가 ~20px로 WCAG 2.2 SC 2.5.8(24x24px, AA)
+            미만이었음(2026-07-16, 감사에서 발견). 왼쪽 정렬/투명 배경 등 나머지
+            디자인은 그대로 두고 세로 패딩만 키움. */
+            padding: 10px 0 !important;
         }
         div.st-key-chip_row button p { text-align: left !important; }
-        div.st-key-chip_row button:hover { border-color: #d9a441 !important; color: #d9a441 !important; }
+        div.st-key-chip_row button:hover { color: var(--accent) !important; }
 
         div.st-key-history_row button {
-            background: #171f14 !important; color: #cdd5c1 !important; border: 1px solid #33402c !important;
+            background: var(--surface-sunken) !important; color: var(--text-body) !important;
+            border: 1px solid var(--border) !important;
             text-align: left !important; justify-content: flex-start !important; white-space: pre-line !important;
             font-weight: 500; line-height: 1.5; padding: 10px 14px;
         }
-        div.st-key-history_row button:hover { border-color: #d9a441 !important; }
+        div.st-key-history_row button:hover { border-color: var(--accent) !important; }
         div.st-key-history_row button p { text-align: left !important; }
 
         div.stButton > button {
-            background: #d9a441; color: #1c2418; border: none; font-weight: 700; border-radius: 8px;
+            background: var(--accent); color: var(--text-on-accent); border: none; font-weight: 700; border-radius: 8px;
         }
-        div.stButton > button:hover { background: #e8b658; color: #1c2418; }
+        div.stButton > button:hover { background: var(--accent-hover); color: var(--text-on-accent); }
 
         button[data-baseweb="tab"] {
-            background: transparent !important; color: #9aa38f !important; font-weight: 700 !important;
+            background: transparent !important; color: var(--text-muted) !important; font-weight: 700 !important;
             flex: 1 1 0 !important; justify-content: center !important;
         }
         button[data-baseweb="tab"] p { color: inherit !important; font-size: 0.95rem !important; }
-        button[data-baseweb="tab"][aria-selected="true"] { color: #d9a441 !important; }
-        button[data-baseweb="tab"][aria-selected="true"] p { color: #d9a441 !important; }
-        div[data-baseweb="tab-highlight"] { background-color: #d9a441 !important; }
-        div[data-baseweb="tab-border"] { background-color: #33402c !important; }
+        button[data-baseweb="tab"][aria-selected="true"] { color: var(--accent) !important; }
+        button[data-baseweb="tab"][aria-selected="true"] p { color: var(--accent) !important; }
+        div[data-baseweb="tab-highlight"] { background-color: var(--accent) !important; }
+        div[data-baseweb="tab-border"] { background-color: var(--border) !important; }
         div[data-baseweb="tab-list"] { gap: 24px !important; width: 100% !important; }
         </style>
         """,
@@ -509,18 +652,37 @@ def _md_bold_to_html(text):
     return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
 
 
+def render_error(message):
+    """st.error()의 기본 빨간 배너 대신 테마에 맞는 에러 카드 (2026-07-16, 감사에서
+    발견 -- 나머지 화면과 완전히 다른 스타일이 연결 실패처럼 상태가 안 좋을 때만
+    튀어나오는 게 특히 나빴음). role="alert"를 붙여서(재감사에서 발견) 스크린
+    리더가 카드가 나타나는 순간 자동으로 읽어주게 함 -- 일반 div는 그냥 지나칠 수 있음."""
+    st.markdown(
+        f"""
+        <div class="error-card" role="alert">
+            <div class="title">연결 오류</div>
+            <div class="body">{message}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def render_header(neo4j_online):
     # 정상 연결(기본 상태)일 땐 상태 표시를 아예 안 보여준다 -- 항상 켜져 있는
     # "ONLINE" 배지는 매번 같은 값이라 실질 정보가 없다는 사용자 피드백(2026-07-16).
-    # 실제로 끊겼을 때만(드문, 행동이 필요한 상태) 눈에 띄게 알린다.
+    # 실제로 끊겼을 때만(드문, 행동이 필요한 상태) 눈에 띄게 알린다. 상태 표시
+    # 자체는 이모지 대신 기존 .dot 패턴(원래 CSS에 정의만 돼 있고 안 쓰이던 클래스)을
+    # 재사용 -- 감사에서 이모지가 기능 아이콘으로 곳곳에 쓰인 것을 정리하며 통일.
     status_html = (
-        '<div class="trace-status" style="color:#e07a5f;">🔴 KNOWLEDGE GRAPH OFFLINE</div>'
+        '<div class="trace-status" style="color:var(--danger);">'
+        '<span class="dot" style="color:var(--danger);">●</span> KNOWLEDGE GRAPH OFFLINE</div>'
         if not neo4j_online else ""
     )
     st.markdown(
         f"""
         <div class="trace-topbar">
-            <div class="trace-logo">TRACE <span class="sub">| KG WORKBENCH</span></div>
+            <h1 class="trace-logo">TRACE <span class="sub">| KG WORKBENCH</span></h1>
             {status_html}
         </div>
         """,
@@ -529,7 +691,7 @@ def render_header(neo4j_online):
 
 
 def render_hero():
-    st.markdown('<div class="section-label"><span class="badge">01</span> QUERY INTELLIGENCE CONSOLE</div>', unsafe_allow_html=True)
+    st.markdown('<h2 class="section-label"><span class="badge">01</span> QUERY INTELLIGENCE CONSOLE</h2>', unsafe_allow_html=True)
     col1, col2 = st.columns([2.2, 1])
     with col1:
         st.markdown(
@@ -577,7 +739,7 @@ def render_query_console():
 
 def render_graphrag_panel(result):
     st.markdown(
-        '<div class="compare-col-title">🕸️ GraphRAG <span class="muted">관계 그래프 탐색</span></div>',
+        '<h3 class="compare-col-title">GraphRAG <span class="muted">관계 그래프 탐색</span></h3>',
         unsafe_allow_html=True,
     )
 
@@ -587,7 +749,7 @@ def render_graphrag_panel(result):
         <div class="card-cream">
             <div style="display:flex; justify-content:space-between; align-items:flex-start;">
                 <div style="font-size:0.75rem; font-weight:700;">다수결 최종 답변</div>
-                <div class="evidence-tag" style="background:#d9a441;">{route_label}</div>
+                <div class="route-badge">{route_label}</div>
             </div>
             <div style="font-size:1.15rem; font-weight:700; margin:10px 0 6px 0;">{_md_bold_to_html(result['answer'])}</div>
         </div>
@@ -619,47 +781,92 @@ def render_graphrag_panel(result):
         unsafe_allow_html=True,
     )
 
-    st.markdown('<div class="section-label" style="margin-top:6px;">KNOWLEDGE GRAPH MAPPING</div>', unsafe_allow_html=True)
+    st.markdown('<h4 class="section-label" style="margin-top:6px;">KNOWLEDGE GRAPH MAPPING</h4>', unsafe_allow_html=True)
     if result["nodes"]:
         seed_names = {m["name"] for e in result["entity_results"] for m in e["matches"]}
+        # 그래프 시각화(캔버스 기반 iframe)는 스크린리더에 아무 정보도 안 남는다 --
+        # 노드/엣지 개수와 타입별 개체 목록을 시각적으로 숨긴 텍스트로 옆에 둬서
+        # 최소한의 텍스트 대안을 제공(2026-07-16, 감사에서 발견).
+        type_summary = {}
+        for n in result["nodes"].values():
+            type_summary.setdefault(TYPE_LABELS_KO.get(n["type"], n["type"]), []).append(n["name"])
+        graph_summary = (
+            f'그래프 시각화: 노드 {len(result["nodes"])}개, 관계 {len(result["edges"])}개. ' +
+            " / ".join(f'{label} {len(names)}개({", ".join(names)})' for label, names in type_summary.items())
+        )
+        st.markdown(f'<div class="sr-only">{graph_summary}</div>', unsafe_allow_html=True)
         html = build_graph_html(result["nodes"], result["edges"], seed_names)
         components.html(html, height=380, scrolling=False)
     else:
         st.markdown('<div class="panel muted">탐색된 그래프가 없습니다.</div>', unsafe_allow_html=True)
 
-    st.markdown('<div class="section-label">AUDITABLE ANALYSIS PATH</div>', unsafe_allow_html=True)
-    value_suffix = f", 값={result['value']}" if result["value"] else ""
-    steps = [
-        f'엔티티 {result["entities"] or "없음"}, 관계타입 {result["relation_type"] or "-"}'
-        f'{value_suffix}로 질의를 분석했습니다.',
+    st.markdown('<h4 class="section-label">이렇게 답을 찾았어요</h4>', unsafe_allow_html=True)
+
+    route_plain = ROUTE_PLAIN_KO.get(result["route"], "그래프를 탐색했어요")
+    entity_word = f'"{", ".join(result["entities"])}"' if result["entities"] else "질문 속 대상"
+    if result["route"] == "no_seed":
+        summary_line = f'{entity_word}을(를) 그래프에서 찾지 못했어요.'
+    else:
+        summary_line = (
+            f'{entity_word}에 대해 {route_plain} — 관련 사실 {n_edges}개를 근거로 답변을 만들었어요.'
+        )
+    st.markdown(f'<p style="font-weight:600; margin:4px 0 14px;">{summary_line}</p>', unsafe_allow_html=True)
+
+    plain_steps = [
+        f'{entity_word}에 대한 질문으로 이해했어요.',
         (
-            f'{n_entities}개 엔티티를 Exact→Alias→Word Boundary→Fuzzy 캐스케이드로 링킹했습니다.'
-            if n_entities else '그래프에서 매칭되는 엔티티를 찾지 못했습니다.'
+            f'그래프에서 {entity_word}과(와) 정확히 일치하는 대상을 찾았어요.'
+            if n_entities else '그래프에서 일치하는 대상을 찾지 못했어요.'
         ),
-        f'"{route_label}" 경로로 라우팅해 사실 {result["n_before_rerank"]}개를 수집했습니다.',
+        f'{route_plain} (관련 사실 {result["n_before_rerank"]}개 발견).',
         (
-            f'사실이 80개를 초과해 임베딩 리랭킹으로 상위 {n_edges}개만 사용했습니다.'
-            if result["n_before_rerank"] > n_edges else '사실 수가 리랭킹 임계값 이하라 전부 사용했습니다.'
+            f'찾은 사실이 많아서, 질문과 가장 관련 높은 {n_edges}개만 추려서 썼어요.'
+            if result["n_before_rerank"] > n_edges else '찾은 사실이 많지 않아서, 전부 답변에 사용했어요.'
         ),
         (
-            '같은 질문을 3회 반복 생성(temperature=0)한 뒤, "모름"이면 evidence 원문 전용 '
-            '재시도를 거치고, LLM 클러스터링으로 다수결 답변을 채택했습니다.'
+            '같은 질문에 3번 답해보고, 가장 일관되게 나온 답을 최종 답변으로 골랐어요.'
             if result["votes"] is not None else
-            '엔티티 링킹이 아무것도 찾지 못하고 속성 스캔으로 이어갈 관계/값도 없어, '
-            '결과가 뻔한 답변 생성 호출은 생략하고 바로 안내 문구를 반환했습니다.'
+            '찾는 대상 자체가 없어서, 답을 만들지 않고 안내 문구만 보여드렸어요.'
             if result["route"] == "no_seed" else
-            '이 경로(1-hop 직접 조회/속성 스캔)는 원래도 답이 안정적이라, 비용 절약을 위해 '
-            '3회 샘플링 없이 단발 호출로 답을 생성했습니다.'
+            '이런 유형의 질문은 답이 안정적으로 나오는 편이라, 한 번만 답변을 만들었어요.'
         ),
     ]
-    steps_html = '<div class="panel">'
-    for i, s in enumerate(steps, 1):
-        steps_html += f'<div class="step-item"><span class="step-num">{i:02d}</span><span>{s}</span></div>'
-    steps_html += '</div>'
-    st.markdown(steps_html, unsafe_allow_html=True)
+    plain_html = '<div class="panel">'
+    for i, s in enumerate(plain_steps, 1):
+        plain_html += f'<div class="step-item"><span class="step-num">{i:02d}</span><span>{s}</span></div>'
+    plain_html += '</div>'
+    st.markdown(plain_html, unsafe_allow_html=True)
+
+    with st.expander("🔧 기술적으로 어떻게 처리됐는지 보기"):
+        value_suffix = f", 값={result['value']}" if result["value"] else ""
+        tech_steps = [
+            f'엔티티 {result["entities"] or "없음"}, 관계타입 {result["relation_type"] or "-"}'
+            f'{value_suffix}로 질의를 분석했습니다.',
+            (
+                f'{n_entities}개 엔티티를 Exact→Alias→Word Boundary→Fuzzy 캐스케이드로 링킹했습니다.'
+                if n_entities else '그래프에서 매칭되는 엔티티를 찾지 못했습니다.'
+            ),
+            f'"{route_label}" 경로로 라우팅해 사실 {result["n_before_rerank"]}개를 수집했습니다.',
+            (
+                f'사실이 80개를 초과해 임베딩 리랭킹으로 상위 {n_edges}개만 사용했습니다.'
+                if result["n_before_rerank"] > n_edges else '사실 수가 리랭킹 임계값 이하라 전부 사용했습니다.'
+            ),
+            (
+                '같은 질문을 3회 반복 생성(temperature=0)한 뒤, "모름"이면 evidence 원문 전용 '
+                '재시도를 거치고, LLM 클러스터링으로 다수결 답변을 채택했습니다.'
+                if result["votes"] is not None else
+                '엔티티 링킹이 아무것도 찾지 못하고 속성 스캔으로 이어갈 관계/값도 없어, '
+                '결과가 뻔한 답변 생성 호출은 생략하고 바로 안내 문구를 반환했습니다.'
+                if result["route"] == "no_seed" else
+                '이 경로(1-hop 직접 조회/속성 스캔)는 원래도 답이 안정적이라, 비용 절약을 위해 '
+                '3회 샘플링 없이 단발 호출로 답을 생성했습니다.'
+            ),
+        ]
+        for i, s in enumerate(tech_steps, 1):
+            st.markdown(f'<div class="step-item"><span class="step-num">{i:02d}</span><span>{s}</span></div>', unsafe_allow_html=True)
 
     if result["votes"] is not None:
-        st.markdown('<div class="section-label">3회 샘플링 결과</div>', unsafe_allow_html=True)
+        st.markdown('<h4 class="section-label">3회 샘플링 결과</h4>', unsafe_allow_html=True)
         votes_html = ""
         for i, v in enumerate(result["votes"], 1):
             chosen = v == result["answer"]
@@ -671,8 +878,8 @@ def render_graphrag_panel(result):
         st.markdown(votes_html, unsafe_allow_html=True)
 
     st.markdown(
-        f'<div class="section-label"><span class="badge">04</span> EVIDENCE LEDGER '
-        f'<span class="muted" style="margin-left:auto;">{n_edges} sources</span></div>',
+        f'<h4 class="section-label"><span class="badge">04</span> EVIDENCE LEDGER '
+        f'<span class="muted" style="margin-left:auto;">{n_edges} sources</span></h4>',
         unsafe_allow_html=True,
     )
     if not result["edges"]:
@@ -700,7 +907,7 @@ def render_graphrag_panel(result):
 
 def render_rag_panel(result):
     st.markdown(
-        '<div class="compare-col-title">📄 Naive RAG <span class="muted">문장 벡터 검색</span></div>',
+        '<h3 class="compare-col-title">Naive RAG <span class="muted">문장 벡터 검색</span></h3>',
         unsafe_allow_html=True,
     )
     st.markdown(
@@ -715,8 +922,8 @@ def render_rag_panel(result):
     )
 
     st.markdown(
-        f'<div class="section-label" style="margin-top:6px;">RETRIEVED CHUNKS '
-        f'<span class="muted" style="margin-left:auto;">top-{RAG_TOP_K}</span></div>',
+        f'<h4 class="section-label" style="margin-top:6px;">RETRIEVED CHUNKS '
+        f'<span class="muted" style="margin-left:auto;">top-{RAG_TOP_K}</span></h4>',
         unsafe_allow_html=True,
     )
     if not result["chunks"]:
@@ -741,29 +948,32 @@ def render_result(item):
     # 이미 계산되어 있고(run_naive_rag_analysis가 GraphRAG와 함께 실행됨), "Naive RAG"
     # 탭을 누를 때만 화면에 나타난다. 두 탭 모두 각각 단일 패널만 보여준다(비교는
     # 탭을 오가며 확인).
-    tab_graph, tab_rag = st.tabs(["🕸️ GraphRAG", "📄 Naive RAG"])
+    tab_graph, tab_rag = st.tabs(["GraphRAG", "Naive RAG"])
     with tab_graph:
         render_graphrag_panel(item["graphrag"])
     with tab_rag:
         render_rag_panel(item["rag"])
 
 
-ROUTE_ICONS = {
-    "1hop": "⚡", "1hop_fallback_bfs": "🕸️", "property_scan": "🔍",
-    "bfs": "🕸️", "no_seed": "❔",
-}
+def _route_icon(route):
+    """히스토리 미리보기용 짧은 마커. 전용 이모지 사전 대신 ROUTE_LABELS_KO의
+    앞머리 기호(①/②'/③)를 그대로 재사용해 라우팅 어휘를 한 곳에서만 관리한다
+    (2026-07-16, 감사에서 이모지가 기능 라벨로 곳곳에 흩어져 있던 것을 정리하며
+    발견 -- 별도 이모지 사전을 만들 이유가 없었음)."""
+    label = ROUTE_LABELS_KO.get(route, "")
+    return label.split(" ", 1)[0] if label else "?"
 
 
 def render_history():
     if not st.session_state.get("history"):
         return
-    st.markdown('<div class="section-label" style="margin-top:24px;">🕒 최근 분석</div>', unsafe_allow_html=True)
+    st.markdown('<h2 class="section-label" style="margin-top:24px;">최근 분석</h2>', unsafe_allow_html=True)
     with st.container(key="history_row"):
         cols = st.columns(2)
         for i, item in enumerate(reversed(st.session_state.history[-6:])):
             with cols[i % 2]:
                 graphrag = item["graphrag"]
-                icon = ROUTE_ICONS.get(graphrag["route"], "🕸️")
+                icon = _route_icon(graphrag["route"])
                 answer_preview = graphrag["answer"].replace("**", "").replace("\n", " ")
                 if len(answer_preview) > 50:
                     answer_preview = answer_preview[:50] + "…"
@@ -802,7 +1012,7 @@ def main():
 
     if run_clicked and query.strip():
         if not neo4j_online:
-            st.error(
+            render_error(
                 "Neo4j에 연결할 수 없습니다. 로컬은 .env, Streamlit Cloud는 앱 Secrets에 "
                 "NEO4J_URI / NEO4J_USERNAME / NEO4J_PASSWORD를 설정했는지 확인하세요."
             )
