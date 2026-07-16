@@ -35,3 +35,6 @@ pinecone==7.3.0
 # GraphRAG 질의 데모 앱 (data/streamlit/main.py)
 streamlit==1.50.0
 pyvis==0.3.2
+
+# GraphRAG 엔티티 링킹 Fuzzy Match 단계 (GraphRAG/graphrag_query.py)
+rapidfuzz==3.13.0
