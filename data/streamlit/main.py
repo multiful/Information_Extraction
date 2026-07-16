@@ -36,6 +36,14 @@ from pyvis.network import Network
 ROOT = Path(__file__).resolve().parent.parent.parent
 load_dotenv(ROOT / ".env")
 
+# Streamlit Cloud엔 .env가 없다 — 대시보드 Secrets를 환경변수로 승격해
+# 아래 os.environ[...] 경로가 로컬(.env)/클라우드(secrets) 모두에서 동작하게 한다.
+try:
+    for _k, _v in st.secrets.items():
+        os.environ.setdefault(_k, str(_v))
+except Exception:
+    pass  # secrets 미설정(로컬 .env만 쓰는 경우)이면 무시
+
 CHAT_MODEL = "gpt-5.4-mini"
 SEEDS_PER_MENTION = 3
 MAX_HOPS = 2
@@ -156,8 +164,7 @@ def find_seed_entities(session, mentions):
         rows = session.run(
             """
             UNWIND $mentions AS m
-            CALL {
-                WITH m
+            CALL (m) {
                 CALL db.index.fulltext.queryNodes('entity_fulltext', m.q) YIELD node
                 RETURN node
                 LIMIT $limit
@@ -447,9 +454,6 @@ def inject_css():
             display: inline-block; background: #2a3524; color: #cdd5c1 !important;
             font-size: 0.68rem; border-radius: 4px; padding: 2px 7px; margin-top: 6px; margin-right: 6px;
         }
-        .evidence-conf { float: right; text-align: right; }
-        .evidence-conf .n { font-size: 1.1rem; font-weight: 700; color: #d9a441; }
-        .evidence-conf .l { font-size: 0.65rem; color: #9aa38f; display: block; }
 
         .history-item {
             display: flex; justify-content: space-between; align-items: center;
@@ -551,16 +555,7 @@ def render_query_console():
 
 def render_result(result):
     st.markdown('<div class="section-label" style="margin-top:8px;">ANALYSIS COMPLETE</div>', unsafe_allow_html=True)
-    col1, col2 = st.columns([4, 1])
-    with col1:
-        st.markdown('<h2 style="margin:0;">그래프 분석 결과</h2>', unsafe_allow_html=True)
-    with col2:
-        conf_pct = round(result["confidence"] * 100)
-        st.markdown(
-            f'<div style="text-align:right;"><span class="muted">종합 정확도</span><br>'
-            f'<span style="font-size:2rem;font-weight:800;color:#d9a441;">{conf_pct}%</span></div>',
-            unsafe_allow_html=True,
-        )
+    st.markdown('<h2 style="margin:0;">그래프 분석 결과</h2>', unsafe_allow_html=True)
 
     matched = len(result["entity_results"]) and any(e["matches"] for e in result["entity_results"])
     status_label = "근거 기반 응답" if result["edges"] else "그래프 근거 없음 (일반 응답)"
@@ -656,7 +651,6 @@ def render_result(result):
         st.markdown('<div class="panel muted">수집된 근거가 없습니다.</div>', unsafe_allow_html=True)
     else:
         for i, e in enumerate(result["edges"], 1):
-            conf_pct = round(e["confidence"] * 100)
             quote = e["evidence"] or "(근거 문장 없음)"
             tag = EVIDENCE_SOURCE_KO.get(e["evidence_source"], e["evidence_source"] or "")
             st.markdown(
@@ -670,7 +664,6 @@ def render_result(result):
                             <span class="evidence-tag">{e['src_name']}</span>
                             {f'<span class="evidence-tag">{tag}</span>' if tag else ''}
                         </div>
-                        <div class="evidence-conf"><span class="n">{conf_pct}%</span><span class="l">신뢰도</span></div>
                     </div>
                 </div>
                 """,
@@ -721,7 +714,10 @@ def main():
 
     if run_clicked and query.strip():
         if not neo4j_online:
-            st.error("Neo4j에 연결할 수 없습니다. .env의 NEO4J_URI/NEO4J_USERNAME/NEO4J_PASSWORD를 확인하세요.")
+            st.error(
+                "Neo4j에 연결할 수 없습니다. 로컬은 .env, Streamlit Cloud는 앱 Secrets에 "
+                "NEO4J_URI / NEO4J_USERNAME / NEO4J_PASSWORD를 설정했는지 확인하세요."
+            )
         else:
             with st.spinner("그래프를 탐색하고 근거를 종합하는 중..."):
                 result = run_analysis(query.strip())
