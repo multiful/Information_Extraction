@@ -285,16 +285,26 @@ def extract_entities(question, repeat=0):
     return cached(cache_key("parse_query_v8", CHAT_MODEL, question, repeat), compute)
 
 
+# DocRED 주석이 국가 '수반'을 HEAD_OF_STATE와 HEAD_OF_GOVERNMENT에 비일관적으로 나눠
+# 넣음 -- 실측(2026-07-16): 미국 대통령은 전부 HEAD_OF_GOVERNMENT, 필리핀 대통령은
+# HEAD_OF_STATE. LLM이 "대통령"을 의미상 맞는 HEAD_OF_STATE로 뽑아도 미국은 1-hop이
+# 사실을 못 찾고 BFS 폴백->"모름"으로 무너졌음(사용자 지적). 프롬프트로 한쪽 라벨을
+# 고르면 다른 나라가 깨지므로(데이터가 양쪽에 흩어짐), 둘 중 하나가 나오면 둘 다 조회.
+LEADER_RELATIONS = {"HEAD_OF_STATE", "HEAD_OF_GOVERNMENT"}
+
+
 def relation_lookup(session, seed_ids, relation_type):
     """seed 노드들에서 relation_type 하나만 1-hop으로 직접 조회 (README "문제 4"
     핵심 설계 결정 3). expand_subgraph()의 BFS와 달리 딱 그 관계 하나만 보므로
     사실이 하나만 나와도 곧장 답변에 쓸 수 있다 -- relation_type은 반드시 호출 전에
     RELATION_TYPES 화이트리스트 검증을 거쳐야 함(Cypher 관계 타입은 파라미터로
-    못 넘기고 문자열 삽입해야 하므로)."""
+    못 넘기고 문자열 삽입해야 하므로). LEADER_RELATIONS 계열이면 한 쌍을 함께 조회한다."""
     if relation_type not in RELATION_TYPES or not seed_ids:
         return []
+    rels = LEADER_RELATIONS if relation_type in LEADER_RELATIONS else {relation_type}
+    rel_pattern = "|".join(sorted(rels))  # 전부 RELATION_TYPES 검증 통과분이라 인젝션 안전
     query = f"""
-    MATCH (h:ZEntity)-[r:{relation_type}]-(n:ZEntity)
+    MATCH (h:ZEntity)-[r:{rel_pattern}]-(n:ZEntity)
     WHERE h.id IN $seed_ids
     RETURN DISTINCT startNode(r).name AS head, type(r) AS relation, endNode(r).name AS tail,
            r.evidence AS evidence
@@ -764,6 +774,7 @@ if __name__ == "__main__":
         # Relation-aware Retrieval 라우팅 확인용 (README "문제 4")
         "Roketsan은 몇 년에 설립됐어?",  # entity + relation_type -> 1-hop 기대
         "1988년에 설립된 조직이 뭐가 있어?",  # entity 없음 -> property_scan 기대
+        "미국 대통령의 이름이 뭐야?",  # HEAD_OF_STATE/HEAD_OF_GOVERNMENT 계열 동시 조회
     ]
     for q in demo_questions:
         answer_question(q)
