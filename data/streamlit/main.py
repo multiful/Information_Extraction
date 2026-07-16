@@ -23,6 +23,7 @@ NEO4J_PASSWORD, NEO4J_DATABASE(선택).
 import difflib
 import json
 import os
+import re
 from pathlib import Path
 
 import streamlit as st
@@ -83,6 +84,16 @@ def get_neo4j_driver():
         auth=(os.environ["NEO4J_USERNAME"], os.environ["NEO4J_PASSWORD"]),
     )
     driver.verify_connectivity()
+    # seed 조회 병목 해결용 fulltext 인덱스. 스키마 소유자는 로더지만, 기존
+    # 적재분에도 자동 적용되도록 best-effort로 보장 (연결 성공 여부와 분리).
+    try:
+        with driver.session(database=os.environ.get("NEO4J_DATABASE")) as s:
+            s.run(
+                "CREATE FULLTEXT INDEX entity_fulltext IF NOT EXISTS "
+                "FOR (e:ZEntity) ON EACH [e.name, e.aliases]"
+            )
+    except Exception:
+        pass  # ponytail: 읽기전용 권한이면 스킵 — 로더가 만든 인덱스에 의존
     return driver
 
 
@@ -116,22 +127,51 @@ def classify_query(openai_client, question):
         return "일반 질의", []
 
 
-def find_seed_entities(session, mention):
-    """엔티티 이름/별칭에 (대소문자 무시) 부분일치하는 노드를 찾고, 멘션과의
-    문자열 유사도를 매칭 점수로 함께 반환한다."""
-    query = """
-    MATCH (e:ZEntity)
-    WHERE toLower(e.name) CONTAINS toLower($mention)
-       OR any(alias IN e.aliases WHERE toLower(alias) CONTAINS toLower($mention))
-    RETURN e.id AS id, e.name AS name, e.type AS type
-    LIMIT $limit
+_LUCENE_SPECIAL = re.compile(r'([+\-&|!(){}\[\]^"~*?:\\/])')
+
+
+def _lucene_query(mention):
+    """멘션을 fulltext 인덱스용 Lucene 쿼리로 변환. 토큰별 prefix 매칭(term*)."""
+    terms = []
+    for tok in mention.split():
+        tok = _LUCENE_SPECIAL.sub(lambda m: "\\" + m.group(1), tok)
+        if tok:
+            terms.append(f"{tok}*")
+    return " ".join(terms)
+
+
+def find_seed_entities(session, mentions):
+    """모든 멘션을 name/aliases fulltext 인덱스로 한 번에 조회해(풀스캔 대신
+    인덱스 조회, 왕복 1회) 후보 노드를 찾고, 멘션과의 문자열 유사도를 매칭
+    점수로 함께 반환한다. 반환: [{"mention", "matches":[{id,name,type,score}]}].
+
+    ponytail: 토큰 prefix 매칭이라 이전 substring(CONTAINS)보다 재현율이 약간
+    좁다 (단일 토큰 내부 부분일치는 놓침). 고유명사 seed엔 충분. 넓혀야 하면
+    `*term*` 하려면 인덱스에 allowLeadingWildcard 필요.
     """
-    rows = list(session.run(query, mention=mention, limit=SEEDS_PER_MENTION))
-    results = []
-    for r in rows:
-        score = difflib.SequenceMatcher(None, mention.lower(), r["name"].lower()).ratio()
-        results.append({"id": r["id"], "name": r["name"], "type": r["type"], "score": score})
-    return results
+    matches_by_mention = {m: [] for m in mentions}
+    payload = [{"mention": m, "q": _lucene_query(m)} for m in mentions]
+    payload = [p for p in payload if p["q"]]
+    if payload:
+        rows = session.run(
+            """
+            UNWIND $mentions AS m
+            CALL {
+                WITH m
+                CALL db.index.fulltext.queryNodes('entity_fulltext', m.q) YIELD node
+                RETURN node
+                LIMIT $limit
+            }
+            RETURN m.mention AS mention, node.id AS id, node.name AS name, node.type AS type
+            """,
+            mentions=payload, limit=SEEDS_PER_MENTION,
+        )
+        for r in rows:
+            score = difflib.SequenceMatcher(None, r["mention"].lower(), r["name"].lower()).ratio()
+            matches_by_mention[r["mention"]].append(
+                {"id": r["id"], "name": r["name"], "type": r["type"], "score": score}
+            )
+    return [{"mention": m, "matches": matches_by_mention[m]} for m in mentions]
 
 
 def expand_subgraph(session, seed_ids):
@@ -249,15 +289,11 @@ def run_analysis(question):
 
     intent, mentions = classify_query(openai_client, question)
 
-    entity_results = []
-    seed_ids = []
     with driver.session(database=NEO4J_DATABASE) as session:
-        for mention in mentions:
-            matches = find_seed_entities(session, mention)
-            entity_results.append({"mention": mention, "matches": matches})
-            seed_ids.extend(m["id"] for m in matches)
-
-        seed_ids = list(dict.fromkeys(seed_ids))  # dedupe, preserve order
+        entity_results = find_seed_entities(session, mentions)
+        seed_ids = list(dict.fromkeys(  # dedupe, preserve order
+            m["id"] for e in entity_results for m in e["matches"]
+        ))
         edges, nodes, depth_reached = expand_subgraph(session, seed_ids)
 
     answer = synthesize_answer(openai_client, question, edges)
