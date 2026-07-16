@@ -78,6 +78,14 @@ EMBED_MODEL = "text-embedding-3-small"
 # 다수결 비용도 그만큼 커짐 -- 흔들리는 경로에만 선택 적용해 비용을 최소화).
 MAJORITY_VOTE_N = 3
 MAJORITY_VOTE_SIMILARITY_THRESHOLD = 0.92
+
+# no_seed 라우팅(엔티티 링킹이 아무것도 못 찾고, relation_type+value 폴백도 없는 경우)
+# 전용 고정 응답. facts=[]인 채로 answer_with_subgraph()를 호출하면 LLM이 매번 "모름"을
+# 생성하는데(2026-07-16 확인 -- Neo4j에 Samsung이 실제로 존재하는데도 "삼성"이라는
+# 한국어 멘션이 안 풀려 이 경로를 탄 사례), 결과가 항상 정해져 있는데 매 질문마다 LLM
+# 호출 비용/지연을 쓰는 게 낭비이고, "모름"은 "관련 사실이 없음"과 "개체 자체를 못
+# 찾음"을 구분 못 해 사용자에게 원인이 안 보임 -- 사용자 피드백으로 분리.
+ENTITY_NOT_FOUND_ANSWER = "엔티티를 찾을 수 없습니다."
 # Fuzzy Match(4단계, RapidFuzz) 컷오프. 구현 중 실측 발견: README 설계 초안은
 # "threshold 예: 0.9"(RapidFuzz 0~100 스케일로 90)를 제시했지만, 실제로 rapidfuzz.
 # fuzz.WRatio로 계산해보면 README가 예시로 든 "Googel" -> "Google" 오타조차 83.3점
@@ -162,7 +170,12 @@ def extract_entities(question, repeat=0):
             '{"entities": ["..."], "relation_type": "..." 또는 null, "value": "..." 또는 null, '
             '"entity_type": "..." 또는 null}\n\n'
             "- entities: 지식그래프 탐색의 시작점이 될 고유명사(회사/기관/인물/지명 등). "
-            "없으면 빈 배열.\n"
+            "없으면 빈 배열. 그래프의 개체명은 원어(주로 영어)로 저장돼 있으므로, 질문에 "
+            "한국어 표기로 나온 잘 알려진 고유명사는 널리 쓰이는 영어 정식 명칭으로 "
+            "정규화해서 담으세요(예: '삼성'->'Samsung', '애플'->'Apple', '구글'->'Google'). "
+            "이미 영어로 쓰여 있으면 그대로 두고, 정확한 영어 표기를 확신할 수 없는 "
+            "생소한 이름은 질문에 쓰인 표기 그대로 둡니다(추측 번역보다 원문 유지가 "
+            "안전 -- 뒤 단계 Fuzzy Match가 오타 수준 차이는 흡수함).\n"
             "- relation_type: 다음 목록 중 하나를 채우거나(entities가 있을 때만) null:\n"
             f"  {', '.join(sorted(RELATION_TYPES))}\n"
             "  예1) \"Apple는 언제 설립됐어?\" -> entities=[\"Apple\"], "
@@ -186,6 +199,9 @@ def extract_entities(question, repeat=0):
             "지역을 물어서 실제로는 2-hop 이상. 예2의 'X가 만드는 Y의 Z' 패턴과 같음 -- "
             "'~의 필터/제품/본사가 만들어지는/있는 장소의 상위 지역' 같은 질문은 대상 개체 "
             "자신의 직접 속성이 아니므로 null)\n"
+            "  예6) \"삼성의 회장은 누구야?\" -> entities=[\"Samsung\"] (한국어 표기 '삼성'을 "
+            "영어 정식 명칭으로 정규화), relation_type=CHAIRPERSON (Samsung 자신의 속성을 "
+            "1-hop으로 바로 물음 -- '회장'이 화이트리스트의 CHAIRPERSON에 대응됨)\n"
             "  entities가 있을 때는 그 개체 '자신'의 속성을 1-hop으로 직접 묻는 경우만 "
             "채우고(예1), 중간에 다른 개체를 하나 더 거쳐야 답이 나오면(예2) null. "
             "entities가 없을 때는 값으로 역검색하는 질문이면 채우고(예3), 그마저도 "
@@ -258,8 +274,15 @@ def extract_entities(question, repeat=0):
     # "항상 틀림"으로 바꿔버릴 수 있다는 걸 보여주는 실제 사례(분산은 줄지만 정확도는
     # 보장 안 함). v2의 예2(Cirit)가 이미 같은 패턴(X가 만드는 Y의 Z)을 다루는데도 Outotec
     # 특유의 "도시는 어느 지역에 속해있어" 표현으로는 일반화가 안 됐음 -- 예5로 이 정확한
-    # 문구를 명시.
-    return cached(cache_key("parse_query_v7", CHAT_MODEL, question, repeat), compute)
+    # 문구를 명시. v8(2026-07-16) -- "삼성의 회장은 누구야?"가 entities=["삼성"]로 추출돼
+    # find_seed_entities()가 그래프의 영어 이름("Samsung")과 매칭 못 해 "엔티티를 찾을 수
+    # 없음"으로 실패하는 걸 실측 발견(Neo4j에 Samsung 노드 자체는 존재함 -- 그래프 커버리지
+    # 문제가 아니라 순수 언어 불일치 버그). 별도 번역 API/캐싱 레이어를 추가하는 대신(질문당
+    # 어차피 1번 호출되는 이 프롬프트에 그대로 얹음 -- 추가 호출/의존성 0개), entities 추출
+    # 규칙에 "잘 알려진 고유명사는 영어 정식 명칭으로 정규화" 지시 + 예6(Samsung/CHAIRPERSON)
+    # 추가. 확신 없는 이름은 원문 유지하도록 명시해 오번역으로 인한 오탐 방지(Fuzzy Match
+    # 단계가 최후 안전망으로 남음).
+    return cached(cache_key("parse_query_v8", CHAT_MODEL, question, repeat), compute)
 
 
 def relation_lookup(session, seed_ids, relation_type):
@@ -596,22 +619,29 @@ def majority_vote_answer(question, facts, n=MAJORITY_VOTE_N):
     유형의 함정). fix_over_merging.py의 cluster_conflict()와 같은 패턴(LLM에게
     N개 항목을 보여주고 그룹 번호 배열로 클러스터링 받기)으로 교체 -- 표현 차이는
     무시하고 핵심 사실이 같은지만 판정하도록 프롬프트에 명시. 만장일치(답이 전부
-    똑같은 문자열)면 이 호출조차 생략."""
+    똑같은 문자열)면 이 호출조차 생략.
+
+    반환: (최종 답, 원본 n개 샘플, 최종 답이 속한 그룹의 표 수). 세 번째 값은
+    호출부가 "몇 표 중 몇 표가 이 답에 동의했는지"를 보여줄 때 쓴다 -- 문자열
+    단순 비교(`v == answer`)로 세면 안 됨: "터키의 SSİK가 세웠습니다"와 "Turkey의
+    SSİK가 세웠습니다"는 클러스터링에서 같은 그룹(핵심 사실 동일)으로 묶여도
+    문자열은 다르므로 과소 카운트된다(2026-07-16, UI에서 다수결 일치도가 실제
+    3/3인데 1/3로 표시되는 걸 사용자가 발견해 수정)."""
     answers = [answer_with_subgraph(question, facts, repeat=i) for i in range(n)]
 
     if len(set(answers)) == 1:
-        return answers[0], answers  # 만장일치 -- 클러스터링 호출 자체 생략
+        return answers[0], answers, n  # 만장일치 -- 클러스터링 호출 자체 생략
 
     group_ids = _cluster_answers(question, answers)
     if group_ids is None:
-        return answers[0], answers  # 클러스터링 실패 -- 안전하게 첫 샘플로 폴백
+        return answers[0], answers, 1  # 클러스터링 실패 -- 안전하게 첫 샘플로 폴백
 
     counts = {}
     for gid in group_ids:
         counts[gid] = counts.get(gid, 0) + 1
     best_gid = max(counts, key=counts.get)
     best_idx = group_ids.index(best_gid)
-    return answers[best_idx], answers
+    return answers[best_idx], answers, counts[best_gid]
 
 
 def _cluster_answers(question, answers):
@@ -699,8 +729,12 @@ def answer_question(question, repeat=0, verbose=True):
     # 실측된 라우팅이 이 둘뿐이고(AirAsia Zest 등), 1hop/property_scan은 사실이
     # 1~수개짜리 짧은 직접 조회라 원래도 안정적이라 3배로 돌릴 필요가 없음(비용 절약).
     votes = None
-    if route in ("bfs", "1hop_fallback_bfs"):
-        answer, votes = majority_vote_answer(question, facts)
+    agree_count = None
+    if route == "no_seed":
+        # facts가 항상 []이라 LLM을 불러도 결과가 뻔히 "모름"으로 고정됨 -- 호출 생략.
+        answer = ENTITY_NOT_FOUND_ANSWER
+    elif route in ("bfs", "1hop_fallback_bfs"):
+        answer, votes, agree_count = majority_vote_answer(question, facts)
     else:
         answer = answer_with_subgraph(question, facts, repeat=repeat)
 
@@ -712,7 +746,7 @@ def answer_question(question, repeat=0, verbose=True):
         print(f"  라우팅: {route}")
         print(f"  서브그래프 사실 수: {n_before_rerank} -> 리랭킹 후 {len(facts)}")
         if votes is not None:
-            print(f"  다수결 표본({len(votes)}개): {votes}")
+            print(f"  다수결 표본({len(votes)}개, {agree_count}표 일치): {votes}")
         print(f"  답변: {answer}")
         print()
 
