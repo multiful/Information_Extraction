@@ -502,6 +502,38 @@ def rerank_facts(question, facts, top_k=RERANK_TOP_K):
     return [facts[i] for i in order]
 
 
+def _answer_with_evidence_only(question, evidence_texts, repeat=0):
+    """Graph-grounded Evidence Retrieval 폴백(2026-07-16, 사용자 제안): Graph Search
+    -> 답 없음 -> 방문 노드 evidence만 재검색 -> LLM -> Answer. 구조화된 triple
+    (head-relation-tail) 없이, 방문한 노드들의 evidence 원문 문장만 모아 다시 답을
+    시도한다 -- answer_with_subgraph()가 "모름"을 낼 때만 호출됨(아래 참고).
+
+    실측 검증(16회 반복 샘플링, AirAsia Zest 합병 질문): 1단계(triple 기반)만 쓰면
+    정답 6 / 모름 8 / 오답 2였는데, "모름"이 나온 8건 중 7건이 이 폴백으로 정답
+    복구됨(정답 6->14). **오답 2건은 이 폴백으로도 안 고쳐짐** -- 애초에 "모름"이
+    아니라 확신에 찬 오답이라 폴백이 아예 안 걸리기 때문(설계상 의도된 범위 밖)."""
+    context = "\n".join(f"- {e}" for e in evidence_texts)
+
+    def compute():
+        prompt = (
+            "아래는 지식그래프 탐색 중 방문한 노드들의 원문 근거 문장 모음입니다. "
+            "구조화된 사실(triple)이 아니라 원문 그대로입니다. 이 문장들만 근거로 "
+            "질문에 한국어로 답하세요. 여러 문장을 종합해 추론해도 됩니다. 근거가 "
+            "불충분하면 반드시 '모름'이라고만 답하세요.\n\n"
+            f"근거 문장 모음:\n{context}\n\n질문: {question}"
+        )
+        resp = openai_client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+        )
+        return resp.choices[0].message.content.strip()
+
+    return cached(
+        cache_key("evidence_only_fallback_v1", CHAT_MODEL, question, context, repeat), compute
+    )
+
+
 def answer_with_subgraph(question, facts, repeat=0):
     """README "문제 8" 대응(2026-07-16): temperature=0으로 답변 생성 비결정성을
     줄임 -- 실측으로 재현됨: MAX_HOPS 3->5 검증 중 "AirAsia Zest는 어느 항공사들이
@@ -510,8 +542,9 @@ def answer_with_subgraph(question, facts, repeat=0):
     직접 확인함 -- relation 스키마 밖 사실(문제 5, 예: "합병")이라 구조화된 fact가 아니라
     evidence 원문에서 LLM이 직접 읽어내야 하는 케이스라 특히 취약. temperature=0으로
     완전히 결정적이 되진 않지만(OpenAI 쪽도 seed/system_fingerprint가 불안정해 보장 안
-    됨) 흔들림 폭을 줄이는 최소 조치 -- 근본 해결은 반복 샘플링+다수결(아래
-    majority_vote_answer(), 2026-07-16 자동화 완료)."""
+    됨) 흔들림 폭을 줄이는 최소 조치 -- 반복 샘플링+다수결(아래 majority_vote_answer())과
+    Graph-grounded Evidence Retrieval 폴백(아래 _answer_with_evidence_only(), 2026-07-16
+    추가)을 병행."""
     if not facts:
         context_block = "(그래프에서 관련 사실을 찾지 못함)"
     else:
@@ -532,9 +565,20 @@ def answer_with_subgraph(question, facts, repeat=0):
         )
         return resp.choices[0].message.content.strip()
 
-    return cached(
+    answer = cached(
         cache_key("answer_with_subgraph_v2", CHAT_MODEL, question, context_block, repeat), compute
     )
+
+    # Graph-grounded Evidence Retrieval 폴백: triple 기반 1차 답변이 "모름"일 때만
+    # evidence 원문 전용 재시도(비용 절약 -- 이미 답을 찾은 경우는 재호출 안 함).
+    if answer == "모름" and facts:
+        evidence_texts = sorted({f["evidence"] for f in facts if f.get("evidence")})
+        if evidence_texts:
+            fallback = _answer_with_evidence_only(question, evidence_texts, repeat=repeat)
+            if fallback != "모름":
+                return fallback
+
+    return answer
 
 
 def majority_vote_answer(question, facts, n=MAJORITY_VOTE_N):
