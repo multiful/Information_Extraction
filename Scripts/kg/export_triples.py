@@ -12,7 +12,8 @@ Neo4j에는 (전역 병합된 개체 + 문서 목록)만 적재되어 있어 evi
   "confidence": 1.0,
   "source": {"document_id": str, "sentence_id": [int, ...], "is_revised": bool},
   "evidence": [str, ...],
-  "evidence_source": "annotated" | "inferred_cooccurrence" | "unresolved_multihop"
+  "evidence_source": "annotated" | "inferred_cooccurrence" | "inferred_bridge"
+                      | "unresolved_multihop"
 }
 
 evidence 보완 로직은 docred_common.resolve_evidence 참고. `source.is_revised`는
@@ -35,7 +36,7 @@ from docred_common import ROOT, is_revised_split, iter_doc_records, load_rel_inf
 
 
 def build_records(splits, rel_info):
-    for split, doc, vertex_meta, mention_sents in iter_doc_records(splits):
+    for split, doc, vertex_meta, mention_sents, sent_entities in iter_doc_records(splits):
         title = doc["title"]
         sents = doc["sents"]
 
@@ -46,7 +47,7 @@ def build_records(splits, rel_info):
             relation_id = label["r"]
 
             evidence_sent_ids, evidence_texts, evidence_source = resolve_evidence(
-                label, mention_sents[h_idx], mention_sents[t_idx], sents
+                label, h_idx, t_idx, mention_sents, sent_entities, sents
             )
 
             yield {

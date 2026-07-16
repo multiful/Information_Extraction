@@ -1,9 +1,13 @@
 """DocRED 원본 JSON을 다루는 공통 유틸 — export_triples.py / load_ground_truth.py /
 export_pinecone.py / export_postgres.py가 공유한다.
 
-핵심은 evidence 보완 로직: DocRED 라벨 중 evidence가 비어있는 경우, head/tail이
-같은 문장에 함께 언급되면 그 문장을 추론해서 채우고("inferred_cooccurrence"),
-그렇지 않으면(multi-hop) 억지로 채우지 않는다("unresolved_multihop").
+핵심은 evidence 보완 로직: DocRED 라벨 중 evidence가 비어있는 경우,
+1) head/tail이 같은 문장에 함께 언급되면 그 문장을 추론해서 채우고
+   ("inferred_cooccurrence"),
+2) 공존 문장이 없으면(multi-hop) head 문장과 tail 문장을 잇는 **공유 개체가
+   있는 문장 쌍**을 찾아 채우고("inferred_bridge", find_bridge_sentences 참고),
+3) 그마저도 없으면(공유 개체 없는 순수 다단 추론) 억지로 채우지 않는다
+   ("unresolved_multihop").
 """
 
 import json
@@ -41,18 +45,50 @@ def sentence_text(sent_tokens):
     return " ".join(sent_tokens)
 
 
-def resolve_evidence(label, mention_sents_h, mention_sents_t, sents):
+def find_bridge_sentences(h_idx, t_idx, mention_sents_h, mention_sents_t, sent_entities):
+    """head/tail이 공존하는 문장이 없을 때, head가 언급된 문장과 tail이 언급된
+    문장을 잇는 **공유하는 제3의 개체가 있는 문장 쌍**을 찾는다 (multi-hop 근거
+    추론). 후보가 여럿이면 두 문장 사이 거리(|h_sent - t_sent|)가 가장 가까운
+    쌍을 택한다. 공유 개체가 있는 쌍이 하나도 없으면 None."""
+    best = None
+    best_dist = None
+    for hs in mention_sents_h:
+        h_ents = sent_entities.get(hs, set()) - {h_idx}
+        if not h_ents:
+            continue
+        for ts in mention_sents_t:
+            t_ents = sent_entities.get(ts, set()) - {t_idx}
+            if h_ents & t_ents:
+                dist = abs(hs - ts)
+                if best_dist is None or dist < best_dist:
+                    best_dist = dist
+                    best = (hs, ts)
+    if best is None:
+        return None
+    return sorted(set(best))
+
+
+def resolve_evidence(label, h_idx, t_idx, mention_sents, sent_entities, sents):
     """(evidence_sent_ids, evidence_texts, evidence_source)를 반환."""
     evidence_sent_ids = label.get("evidence", [])
     evidence_source = "annotated"
 
     if not evidence_sent_ids:
+        mention_sents_h = mention_sents[h_idx]
+        mention_sents_t = mention_sents[t_idx]
         cooccur = sorted(set(mention_sents_h) & set(mention_sents_t))
         if cooccur:
             evidence_sent_ids = cooccur
             evidence_source = "inferred_cooccurrence"
         else:
-            evidence_source = "unresolved_multihop"
+            bridge = find_bridge_sentences(
+                h_idx, t_idx, mention_sents_h, mention_sents_t, sent_entities
+            )
+            if bridge:
+                evidence_sent_ids = bridge
+                evidence_source = "inferred_bridge"
+            else:
+                evidence_source = "unresolved_multihop"
 
     evidence_texts = [
         sentence_text(sents[sid]) for sid in evidence_sent_ids if sid < len(sents)
@@ -61,10 +97,12 @@ def resolve_evidence(label, mention_sents_h, mention_sents_t, sents):
 
 
 def iter_doc_records(splits):
-    """split마다 문서를 순회하며 (split, doc, vertex_meta, mention_sents)를 yield.
+    """split마다 문서를 순회하며 (split, doc, vertex_meta, mention_sents,
+    sent_entities)를 yield.
 
     vertex_meta[i] = (canonical_name, type), mention_sents[i] = 그 개체가
-    언급된 문장 id 정렬 리스트.
+    언급된 문장 id 정렬 리스트, sent_entities[sent_id] = 그 문장에 언급된
+    개체(vertexSet 인덱스) 집합 (find_bridge_sentences가 사용).
     """
     for split in splits:
         docs = load_split(split)
@@ -73,7 +111,11 @@ def iter_doc_records(splits):
             mention_sents = [
                 sorted(set(m["sent_id"] for m in cluster)) for cluster in doc["vertexSet"]
             ]
-            yield split, doc, vertex_meta, mention_sents
+            sent_entities = {}
+            for vidx, sids in enumerate(mention_sents):
+                for sid in sids:
+                    sent_entities.setdefault(sid, set()).add(vidx)
+            yield split, doc, vertex_meta, mention_sents, sent_entities
 
 
 def global_entity_id(name, type_):

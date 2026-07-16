@@ -31,3 +31,7 @@ python-dotenv==1.0.1
 # RAG 벡터 적재 (RAG/pinecone.py, Scripts/kg/upsert_pinecone.py -> OpenAI 임베딩 + Pinecone)
 openai==2.35.1
 pinecone==7.3.0
+
+# GraphRAG 질의 데모 앱 (data/streamlit/main.py)
+streamlit==1.50.0
+pyvis==0.3.2

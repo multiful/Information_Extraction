@@ -73,7 +73,7 @@ def build_graph(splits, rel_info):
     entities = {}
     edges = []
 
-    for split, doc, vertex_meta, mention_sents in iter_doc_records(splits):
+    for split, doc, vertex_meta, mention_sents, sent_entities in iter_doc_records(splits):
         title = doc["title"]
         sents = doc["sents"]
         vertex_to_entity_id = []
@@ -91,7 +91,7 @@ def build_graph(splits, rel_info):
             h_idx, t_idx = label["h"], label["t"]
             relation_id = label["r"]
             evidence_sent_ids, evidence_texts, evidence_source = resolve_evidence(
-                label, mention_sents[h_idx], mention_sents[t_idx], sents
+                label, h_idx, t_idx, mention_sents, sent_entities, sents
             )
 
             edges.append(
