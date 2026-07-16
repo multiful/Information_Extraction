@@ -198,6 +198,12 @@ def load_into_neo4j(entity_rows_by_type, edge_rows_by_type, batch_size):
             f"CREATE CONSTRAINT {ENTITY_LABEL.lower()}_id_unique IF NOT EXISTS "
             f"FOR (e:{ENTITY_LABEL}) REQUIRE e.id IS UNIQUE"
         )
+        # 앱 seed 조회용 fulltext 인덱스 (name/aliases). toLower CONTAINS 풀스캔을
+        # 인덱스 조회로 대체한다 (data/streamlit/main.py find_seed_entities).
+        session.run(
+            f"CREATE FULLTEXT INDEX entity_fulltext IF NOT EXISTS "
+            f"FOR (e:{ENTITY_LABEL}) ON EACH [e.name, e.aliases]"
+        )
 
         total_entities = 0
         for type_label, rows in entity_rows_by_type.items():
