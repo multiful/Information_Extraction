@@ -498,7 +498,7 @@ def inject_css():
 
         .hero-title { font-size: 2.4rem; line-height: 1.25; font-weight: 700; color: var(--text-bright); margin: 4px 0 10px 0; }
         .hero-title .accent { color: inherit; }
-        .hero-sub { color: var(--text-soft); font-size: 0.95rem; max-width: 620px; }
+        .hero-sub { color: var(--text-soft); font-size: 0.95rem; max-width: 880px; }
 
         .pipeline-box { font-size: 0.85rem; }
         .pipeline-item { display: flex; gap: 8px; padding: 4px 0; color: var(--text-body); }
@@ -831,38 +831,8 @@ def render_graphrag_panel(result):
             '이런 유형의 질문은 답이 안정적으로 나오는 편이라, 한 번만 답변을 만들었어요.'
         ),
     ]
-    plain_html = '<div class="panel">'
-    for i, s in enumerate(plain_steps, 1):
-        plain_html += f'<div class="step-item"><span class="step-num">{i:02d}</span><span>{s}</span></div>'
-    plain_html += '</div>'
-    st.markdown(plain_html, unsafe_allow_html=True)
-
     with st.expander("🔧 기술적으로 어떻게 처리됐는지 보기"):
-        value_suffix = f", 값={result['value']}" if result["value"] else ""
-        tech_steps = [
-            f'엔티티 {result["entities"] or "없음"}, 관계타입 {result["relation_type"] or "-"}'
-            f'{value_suffix}로 질의를 분석했습니다.',
-            (
-                f'{n_entities}개 엔티티를 Exact→Alias→Word Boundary→Fuzzy 캐스케이드로 링킹했습니다.'
-                if n_entities else '그래프에서 매칭되는 엔티티를 찾지 못했습니다.'
-            ),
-            f'"{route_label}" 경로로 라우팅해 사실 {result["n_before_rerank"]}개를 수집했습니다.',
-            (
-                f'사실이 80개를 초과해 임베딩 리랭킹으로 상위 {n_edges}개만 사용했습니다.'
-                if result["n_before_rerank"] > n_edges else '사실 수가 리랭킹 임계값 이하라 전부 사용했습니다.'
-            ),
-            (
-                '같은 질문을 3회 반복 생성(temperature=0)한 뒤, "모름"이면 evidence 원문 전용 '
-                '재시도를 거치고, LLM 클러스터링으로 다수결 답변을 채택했습니다.'
-                if result["votes"] is not None else
-                '엔티티 링킹이 아무것도 찾지 못하고 속성 스캔으로 이어갈 관계/값도 없어, '
-                '결과가 뻔한 답변 생성 호출은 생략하고 바로 안내 문구를 반환했습니다.'
-                if result["route"] == "no_seed" else
-                '이 경로(1-hop 직접 조회/속성 스캔)는 원래도 답이 안정적이라, 비용 절약을 위해 '
-                '3회 샘플링 없이 단발 호출로 답을 생성했습니다.'
-            ),
-        ]
-        for i, s in enumerate(tech_steps, 1):
+        for i, s in enumerate(plain_steps, 1):
             st.markdown(f'<div class="step-item"><span class="step-num">{i:02d}</span><span>{s}</span></div>', unsafe_allow_html=True)
 
     if result["votes"] is not None:
