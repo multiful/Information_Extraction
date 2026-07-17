@@ -171,6 +171,7 @@ def run_graphrag_analysis(question):
     """
     parsed = gq.extract_entities(question)
     mentions = parsed["entities"]
+    entity_hints = parsed["entity_hints"]
     relation_type = parsed["relation_type"]
     value = parsed["value"]
     entity_type = parsed["entity_type"]
@@ -178,8 +179,8 @@ def run_graphrag_analysis(question):
     with gq.driver.session(database=gq.NEO4J_DATABASE) as session:
         entity_results = []
         seed_ids = []
-        for mention in mentions:
-            rows = gq.find_seed_entities(session, mention)
+        for mention, hint in zip(mentions, entity_hints):
+            rows = gq.find_seed_entities(session, mention, mention_type=hint)
             matches = [{"id": r["id"], "name": r["name"], "type": r["type"]} for r in rows]
             entity_results.append({"mention": mention, "matches": matches})
             seed_ids.extend(m["id"] for m in matches)
@@ -687,14 +688,20 @@ def inject_css():
             border: 1px solid var(--border-input) !important;
         }
         div.st-key-query_console p { color: var(--text-dim) !important; margin: 0 !important; }
+        div.st-key-chip_row { gap: 0.15rem !important; }
         div.st-key-chip_row button {
             background: transparent !important; color: var(--text-soft) !important; border: none !important;
             font-weight: 500; font-size: 0.78rem; white-space: normal; text-align: left !important;
             justify-content: flex-start !important;
-            /* 4px -> 10px: 실제 탭 가능 높이가 ~20px로 WCAG 2.2 SC 2.5.8(24x24px, AA)
-            미만이었음(2026-07-16, 감사에서 발견). 왼쪽 정렬/투명 배경 등 나머지
-            디자인은 그대로 두고 세로 패딩만 키움. */
-            padding: 10px 0 !important;
+            /* 4px -> 10px -> 5px: WCAG 2.2 SC 2.5.8(24x24px, AA) 탭 타깃 기준은
+            지키되(0.78rem 텍스트 줄높이 ~20px + 상하 5px = ~30px, 여전히 24px 이상),
+            사용자가 "예시 문장 사이가 너무 떨어져 보인다"고 지적해 컨테이너 gap을
+            줄인 것만으론 부족해 버튼 자체 패딩도 더 줄임(2026-07-17). Streamlit
+            st.button은 min-height: 44px가 기본이라 패딩만 줄이면 반영이 안 됨 --
+            같이 낮춰야 실제로 줄어듦(30px는 여전히 24px WCAG 기준 이상).*/
+            padding: 5px 0 !important;
+            min-height: 30px !important;
+            height: auto !important;
         }
         div.st-key-chip_row button p { text-align: left !important; }
         div.st-key-chip_row button:hover, div.st-key-chip_row button:focus-visible { color: var(--accent) !important; }
