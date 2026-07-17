@@ -330,7 +330,53 @@ def run_naive_rag_analysis(question):
 # 그래프 시각화
 # ---------------------------------------------------------------------------
 
-def build_graph_html(nodes, edges, seed_names):
+def _hop_distances(nodes, edges, seed_names):
+    """seed 노드로부터 각 노드까지의 최단 hop 수를 BFS로 계산 (그래프에 이미 있는
+    로컬 edges만 씀 -- graphrag_query.py의 리랭킹 결과 자체를 건드리지 않고, 이미
+    받은 사실 목록 안에서만 "seed에서 얼마나 먼가"를 매긴다). seed와 안 이어진
+    노드는 None (가장 흐리게 처리)."""
+    adjacency = {name: set() for name in nodes}
+    for e in edges:
+        if e["src_name"] in adjacency and e["dst_name"] in adjacency:
+            adjacency[e["src_name"]].add(e["dst_name"])
+            adjacency[e["dst_name"]].add(e["src_name"])
+
+    distances = {name: 0 for name in seed_names if name in nodes}
+    frontier = list(distances.keys())
+    while frontier:
+        next_frontier = []
+        for name in frontier:
+            for neighbor in adjacency.get(name, ()):
+                if neighbor not in distances:
+                    distances[neighbor] = distances[name] + 1
+                    next_frontier.append(neighbor)
+        frontier = next_frontier
+    return distances
+
+
+def _relevance_opacity(distances, name):
+    """_hop_distances() 결과 하나를 그래프 노드/엣지와 근거 카드 양쪽에서 같은 기준으로
+    쓰기 위한 공용 함수 -- seed에서 먼 사실일수록 흐리게(그래프)/접어서(근거 원장)
+    처리하는 두 UI가 서로 다른 거리 판정을 쓰면 "그래프에선 흐린데 근거 원장에선
+    또렷한" 식으로 어긋난다."""
+    d = distances.get(name)
+    if d is None:
+        return 0.45  # seed와 연결 안 된 노드 -- 가장 흐리게
+    return {0: 1.0, 1: 1.0}.get(d, 0.7 if d == 2 else 0.45)
+
+
+def _answer_cited_names(answer_text, nodes):
+    """답변 텍스트에 실제로 이름이 등장하는 노드를 골라, 근거 원장/그래프의 관련도
+    판정에 seed 멘션과 함께 추가 기준점으로 쓴다. 기존엔 질문에서 링킹된 seed로부터의
+    거리만 썼는데, 멀티홉 BFS 답변은 원래 seed에서 먼 노드를 근거로 삼는 게 정상이라
+    정작 답을 증명하는 사실이 "관련도 낮음"으로 접혀버리는 문제가 있었음(2026-07-17,
+    재재재감사 -- Outotec 질문에서 실제 근거인 South Karelia 사실이 접힌 채 숨어있던
+    걸 발견). 답변에 이름이 등장하는 노드는 seed와 동급으로 취급해 그 노드 및 인접
+    사실이 흐려지지/접히지 않게 한다."""
+    return {name for name in nodes if name and name in answer_text}
+
+
+def build_graph_html(nodes, edges, seed_names, distances):
     net = Network(
         height="440px", width="100%", bgcolor="#131c11", font_color="#eee8d8",
         directed=True,
@@ -341,6 +387,17 @@ def build_graph_html(nodes, edges, seed_names):
         cdn_resources="in_line",
     )
     net.barnes_hut(gravity=-3500, central_gravity=0.25, spring_length=130, spring_strength=0.02)
+
+    # seed에서 먼 노드일수록 흐리게 -- 재감사(critique)에서 두 평가 모두 실측(같은
+    # 질문을 각자 따로 재현): 멀티홉 BFS가 모아온, 실제 답변과 무관해 보이는 개체가
+    # (예: AirAsia Zest 질문에 비디오 게임/게임기 클러스터가) 정답과 동일한 시각적
+    # 무게로 그려져서 발표 중 신뢰를 깎을 수 있음(2026-07-16). graphrag_query.py의
+    # 리랭킹 로직 자체는 이 UI 파일 소관이 아니라 안 건드리고, 이미 받은 사실
+    # 안에서 seed로부터의 거리만으로 흐림 정도를 매기는 시각화 전용 휴리스틱.
+    # distances는 render_graphrag_panel()에서 한 번만 계산해 넘겨받는다 -- 근거
+    # 원장(Evidence Ledger)의 관련도 접기 로직과 같은 거리 판정을 공유해야 두
+    # 패널이 "이 사실이 seed에서 얼마나 먼가"에 대해 서로 다른 답을 안 낸다
+    # (2026-07-16, 재재감사).
 
     for name, info in nodes.items():
         is_seed = name in seed_names
@@ -354,6 +411,7 @@ def build_graph_html(nodes, edges, seed_names):
             shape="dot",
             size=26 if is_seed else 17,
             font={"color": "#f5f1e6", "size": 13},
+            opacity=_relevance_opacity(distances, name),
         )
 
     seen_pairs = set()
@@ -362,10 +420,11 @@ def build_graph_html(nodes, edges, seed_names):
         if pair in seen_pairs or e["src_name"] not in nodes or e["dst_name"] not in nodes:
             continue
         seen_pairs.add(pair)
+        edge_opacity = min(_relevance_opacity(distances, e["src_name"]), _relevance_opacity(distances, e["dst_name"]))
         net.add_edge(
             e["src_name"], e["dst_name"],
             label=e["relation"],
-            color="#5c6b57",
+            color={"color": "#5c6b57", "opacity": edge_opacity},
             font={"size": 10, "color": "#c9c2a8", "strokeWidth": 0},
             arrows="to",
         )
@@ -428,7 +487,13 @@ def inject_css():
             --text-label: #b7c2a8;
             --text-muted: #9aa38f;
             --text-soft: #a9b39c;
-            --text-dim: #6b7362;
+            /* #6b7362 -> #5c5644: 재감사(critique)에서 크림 카드(cream) 배경 위에서
+            4.04:1, 어두운 배경 위에서 3.42:1로 둘 다 WCAG AA 4.5:1 미달인 걸 두
+            평가가 독립적으로 실측 확인(2026-07-16). 배경이 밝을 때/어두울 때 필요한
+            색 방향이 정반대라 값 하나로는 둘 다 못 맞춤 -- 이 토큰은 크림(밝은) 배경
+            전용으로 재정의(크림 위 5.98:1)하고, 어두운 배경 쪽 사용처는 전부
+            --text-muted(이미 어두운 배경에서 6.45:1로 통과)를 쓰도록 분리. */
+            --text-dim: #5c5644;
             --text-body: #cdd5c1;
             --text-on-accent: #1c2418;
 
@@ -509,7 +574,21 @@ def inject_css():
             padding: 22px 26px; margin: 10px 0 18px 0;
         }
         .card-cream * { color: var(--text-on-accent); }
-        .muted { color: var(--text-dim) !important; font-size: 0.8rem; }
+        /* 정답 콜아웃 -- 재재재감사(critique)에서 발견: 요약 비교 행을 없앤 뒤
+        (2026-07-17, 사용자 피드백) 답변 자체가 GraphRAG는 다수결이 있을 때만
+        (투표 카드 안에), naive RAG는 아예 어디에도 안 뜨는 채로 남아있었음 --
+        "이 앱의 핵심 산출물"이 정작 전용 마크업이 없었던 것. 각 패널 최상단에
+        route/투표 여부와 무관하게 항상 렌더링. */
+        .answer-label {
+            font-size: 0.72rem; font-weight: 700; letter-spacing: 1px; text-transform: uppercase;
+            color: var(--text-dim); margin-bottom: 6px;
+        }
+        .answer-text { font-size: 1.15rem; font-weight: 700; margin: 0; }
+        /* --text-dim(6b7362)이 어두운 배경에서 3.42:1로 WCAG AA 미달인 걸 재감사에서
+        두 평가 모두 실측(2026-07-16) -- .muted는 전부 어두운 배경 위에서만 쓰이므로
+        --text-muted(6.45:1 통과)로 교체. 크림 카드 전용 밝은-배경 변형이 필요해지면
+        --text-dim(카드 위 5.98:1로 이미 맞춰둔 값)을 다시 쓰면 됨. */
+        .muted { color: var(--text-muted) !important; font-size: 0.8rem; }
 
         .stat-row {
             display: flex; flex-wrap: wrap; gap: 0; border: 1px solid var(--border); border-radius: 10px;
@@ -529,6 +608,15 @@ def inject_css():
         .stat-cell .label { font-size: 0.72rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px; }
         .stat-cell .value { font-size: 1.6rem; font-weight: 700; color: var(--text-bright); }
         .stat-cell .value .unit { font-size: 0.85rem; color: var(--text-muted); font-weight: 400; margin-left: 4px; }
+        /* 다수결 일치도가 낮을 때(3표 중 1표) 강한 일치(3/3)와 똑같은 스타일로
+        보이던 것을 재감사(critique)에서 두 평가 모두 발견 -- 신뢰도가 낮은 답변이
+        시각적으로 구분 안 되는 게 "증거 기반 감사"라는 앱의 핵심 취지와 어긋남.
+        일치도가 과반 미만일 때만 danger 톤으로 눈에 띄게 함. */
+        .stat-cell .value.weak-consensus { color: var(--danger); }
+        .consensus-caveat {
+            font-size: 0.78rem; color: var(--danger); font-weight: 600;
+            margin: -4px 0 14px; display: flex; align-items: center; gap: 6px;
+        }
 
         .panel {
             background: var(--surface-panel); border: 1px solid var(--border); border-radius: 12px;
@@ -609,7 +697,7 @@ def inject_css():
             padding: 10px 0 !important;
         }
         div.st-key-chip_row button p { text-align: left !important; }
-        div.st-key-chip_row button:hover { color: var(--accent) !important; }
+        div.st-key-chip_row button:hover, div.st-key-chip_row button:focus-visible { color: var(--accent) !important; }
 
         div.st-key-history_row button {
             background: var(--surface-sunken) !important; color: var(--text-body) !important;
@@ -617,24 +705,47 @@ def inject_css():
             text-align: left !important; justify-content: flex-start !important; white-space: pre-line !important;
             font-weight: 500; line-height: 1.5; padding: 10px 14px;
         }
-        div.st-key-history_row button:hover { border-color: var(--accent) !important; }
+        div.st-key-history_row button:hover, div.st-key-history_row button:focus-visible { border-color: var(--accent) !important; }
         div.st-key-history_row button p { text-align: left !important; }
 
         div.stButton > button {
             background: var(--accent); color: var(--text-on-accent); border: none; font-weight: 700; border-radius: 8px;
+            min-height: 44px;
         }
-        div.stButton > button:hover { background: var(--accent-hover); color: var(--text-on-accent); }
+        div.stButton > button:hover, div.stButton > button:focus-visible { background: var(--accent-hover); color: var(--text-on-accent); }
 
         button[data-baseweb="tab"] {
             background: transparent !important; color: var(--text-muted) !important; font-weight: 700 !important;
-            flex: 1 1 0 !important; justify-content: center !important;
+            flex: 1 1 0 !important; justify-content: center !important; min-height: 44px !important;
+        }
+        /* 기술 상세 expander 토글도 나머지 버튼과 같은 44px 최소 터치 타깃 기준을
+        맞춘다 -- 감사(audit)에서 발견: chip_row/history_row 버튼은 이미 이 기준을
+        맞춰뒀는데(2026-07-16), primary 버튼/탭/expander 세 곳은 스트림릿 기본
+        높이(38-40px)로 남아 있었음. */
+        [data-testid="stExpander"] summary {
+            min-height: 44px; display: flex; align-items: center;
         }
         button[data-baseweb="tab"] p { color: inherit !important; font-size: 0.95rem !important; }
         button[data-baseweb="tab"][aria-selected="true"] { color: var(--accent) !important; }
         button[data-baseweb="tab"][aria-selected="true"] p { color: var(--accent) !important; }
+        button[data-baseweb="tab"]:focus-visible { color: var(--accent) !important; }
         div[data-baseweb="tab-highlight"] { background-color: var(--accent) !important; }
         div[data-baseweb="tab-border"] { background-color: var(--border) !important; }
         div[data-baseweb="tab-list"] { gap: 24px !important; width: 100% !important; }
+
+        /* :hover 색만 미러링하는 위 규칙들과 별개로, 키보드 포커스 링 자체가
+        스트림릿 기본값(브랜드 레드)으로 새는 걸 막는다 -- 재재감사(critique)에서
+        발견: 이 앱 자신의 --danger/약한-합의 경고색과 같은 붉은 계열이라, 버튼에
+        Tab으로 포커스만 줘도 "뭔가 잘못됐다"는 신호처럼 보임(2026-07-16). 마우스
+        클릭 시엔 안 뜨고 키보드 포커스에만 뜨도록 :focus-visible만 사용. */
+        div.stButton > button:focus-visible,
+        div.st-key-chip_row button:focus-visible,
+        div.st-key-history_row button:focus-visible {
+            outline: 2px solid var(--accent) !important; outline-offset: 2px; box-shadow: none !important;
+        }
+        button[data-baseweb="tab"]:focus-visible {
+            outline: 2px solid var(--accent) !important; outline-offset: -3px; box-shadow: none !important;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -650,6 +761,25 @@ def _md_bold_to_html(text):
     커스텀 CSS 카드(raw HTML 블록) 안에 그대로 넣으면 스트림릿 마크다운 파서가
     안 먹혀 별표가 그대로 보인다 -- <b> 태그로 직접 변환."""
     return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+
+
+def _matched_exactly(entity_results):
+    """모든 멘션이 매칭된 엔티티 이름과 대소문자 무시 완전히 같은 문자열인지 확인한다.
+    graphrag_query.py의 find_seed_entities()는 Exact/Alias/Word Boundary/Fuzzy 캐스케이드
+    중 어느 단계로 찾았는지를 반환하지 않고(그 파일은 이 UI가 손댈 범위 밖 -- 파일 상단
+    docstring 참고), 이미 갖고 있는 mention 문자열과 matched name만 비교해도 "정확히
+    그 이름인가"는 여기서 판단할 수 있다. 하나라도 이름이 다르면(Alias/Word Boundary/
+    Fuzzy로 찾았다는 뜻) '정확히 일치'라고 말하지 않는다(2026-07-17, 재재재감사 --
+    바로 위 기술 상세 expander가 보여주는 실제 캐스케이드 결과와 요약 문장이 어긋나던
+    문제)."""
+    if not entity_results:
+        return False
+    for er in entity_results:
+        if not er["matches"]:
+            return False
+        if not any(m["name"].lower() == er["mention"].lower() for m in er["matches"]):
+            return False
+    return True
 
 
 def render_error(message):
@@ -742,48 +872,72 @@ def render_graphrag_panel(result):
         '<h3 class="compare-col-title">GraphRAG <span class="muted">관계 그래프 탐색</span></h3>',
         unsafe_allow_html=True,
     )
-
+    # 정답은 route/투표 여부와 무관하게 항상 패널 최상단에 렌더링(2026-07-17,
+    # 재재재감사 -- 예전엔 votes가 있을 때만 투표 카드 안에서만 보였고, 더 흔하고
+    # 안정적인 1hop/property_scan 라우팅에서는 답이 화면 어디에도 안 떴음).
     route_label = ROUTE_LABELS_KO.get(result["route"], result["route"])
     st.markdown(
         f"""
         <div class="card-cream">
             <div style="display:flex; justify-content:space-between; align-items:flex-start;">
-                <div style="font-size:0.75rem; font-weight:700;">다수결 최종 답변</div>
+                <div class="answer-label">정답</div>
                 <div class="route-badge">{route_label}</div>
             </div>
-            <div style="font-size:1.15rem; font-weight:700; margin:10px 0 6px 0;">{_md_bold_to_html(result['answer'])}</div>
+            <div class="answer-text">{_md_bold_to_html(result['answer'])}</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
-
     n_entities = len(result["seed_ids"])
     n_nodes = len(result["nodes"])
     n_edges = len(result["edges"])
+    # seed_names/distances는 그래프 시각화의 hop-거리 흐림 처리와 근거 원장의
+    # "관련도 낮은 근거 접기"가 정확히 같은 기준을 쓰도록 여기서 한 번만 계산해
+    # 두 섹션에 그대로 넘긴다(2026-07-16, 재재감사 -- 근거 원장에 관련도 신호가
+    # 전혀 없어, 그래프는 이미 해결한 문제(무관한 사실이 정답과 같은 무게로
+    # 보임)가 정작 답을 검증하는 화면엔 그대로 남아 있었음). 답변 텍스트에 실제
+    # 등장하는 노드도 seed에 합쳐서 넘긴다(2026-07-17, 재재재감사 -- 안 그러면
+    # 멀티홉 답변을 실제로 증명하는, seed에서 먼 사실이 "관련도 낮음"으로 접힘).
+    seed_names = {m["name"] for e in result["entity_results"] for m in e["matches"]}
+    seed_names |= _answer_cited_names(result["answer"], result["nodes"])
+    distances = _hop_distances(result["nodes"], result["edges"], seed_names)
     votes = result["votes"]
+    is_weak_consensus = False
     if votes is not None:
         # agree_count는 majority_vote_answer()의 LLM 클러스터링 결과(핵심 사실
         # 기준 그룹 크기)를 그대로 쓴다 -- 문자열 단순 비교로 세면 "터키의 SSİK가
         # 세웠습니다" vs "Turkey의 SSİK가 세웠습니다"처럼 표현만 다른 같은 사실이
         # 별개로 카운트돼 실제보다 낮은 일치도가 표시된다(2026-07-16, 사용자가
         # 3표가 사실상 같은 내용인데 1/3로 뜨는 걸 발견해 수정).
+        is_weak_consensus = result["agree_count"] * 2 < len(votes)
         consensus_value = f'{result["agree_count"]}<span class="unit">/{len(votes)}표 일치</span>'
     else:
         consensus_value = '<span style="font-size:1rem;">직접 조회</span>'
+    consensus_class = " weak-consensus" if is_weak_consensus else ""
     st.markdown(
         f"""
         <div class="stat-row">
             <div class="stat-cell"><div class="label">매칭 엔티티</div><div class="value">{n_entities}<span class="unit">개</span></div></div>
-            <div class="stat-cell"><div class="label">다수결 일치도</div><div class="value">{consensus_value}</div></div>
+            <div class="stat-cell"><div class="label">다수결 일치도</div><div class="value{consensus_class}">{consensus_value}</div></div>
             <div class="stat-cell"><div class="label">최종 사실</div><div class="value">{n_edges}<span class="unit">개</span></div></div>
         </div>
         """,
         unsafe_allow_html=True,
     )
+    if is_weak_consensus:
+        # 재감사(critique)에서 두 평가 모두 발견: 1/3 일치와 3/3 일치가 시각적으로
+        # 완전히 같은 카드/배지로 나와서, "감사 가능성"이 핵심 가치인 앱에서 정작
+        # 가장 못 믿을 답변이 가장 믿을 만한 답변과 구분이 안 됐음. 과반 미만일 때만
+        # 눈에 띄는 경고 문구를 answer 바로 아래 추가.
+        st.markdown(
+            '<div class="consensus-caveat">'
+            '샘플 간 답변이 크게 갈렸어요 — 아래 "3회 샘플링 결과"를 함께 확인하고 신중하게 해석하세요.'
+            '</div>',
+            unsafe_allow_html=True,
+        )
 
     st.markdown('<h4 class="section-label" style="margin-top:6px;">KNOWLEDGE GRAPH MAPPING</h4>', unsafe_allow_html=True)
     if result["nodes"]:
-        seed_names = {m["name"] for e in result["entity_results"] for m in e["matches"]}
         # 그래프 시각화(캔버스 기반 iframe)는 스크린리더에 아무 정보도 안 남는다 --
         # 노드/엣지 개수와 타입별 개체 목록을 시각적으로 숨긴 텍스트로 옆에 둬서
         # 최소한의 텍스트 대안을 제공(2026-07-16, 감사에서 발견).
@@ -795,7 +949,7 @@ def render_graphrag_panel(result):
             " / ".join(f'{label} {len(names)}개({", ".join(names)})' for label, names in type_summary.items())
         )
         st.markdown(f'<div class="sr-only">{graph_summary}</div>', unsafe_allow_html=True)
-        html = build_graph_html(result["nodes"], result["edges"], seed_names)
+        html = build_graph_html(result["nodes"], result["edges"], seed_names, distances)
         components.html(html, height=380, scrolling=False)
     else:
         st.markdown('<div class="panel muted">탐색된 그래프가 없습니다.</div>', unsafe_allow_html=True)
@@ -816,7 +970,10 @@ def render_graphrag_panel(result):
         f'{entity_word}에 대한 질문으로 이해했어요.',
         (
             f'그래프에서 {entity_word}과(와) 정확히 일치하는 대상을 찾았어요.'
-            if n_entities else '그래프에서 일치하는 대상을 찾지 못했어요.'
+            if n_entities and _matched_exactly(result["entity_results"])
+            else f'그래프에서 {entity_word}과(와) 관련된 대상을 찾았어요.'
+            if n_entities
+            else '그래프에서 일치하는 대상을 찾지 못했어요.'
         ),
         f'{route_plain} (관련 사실 {result["n_before_rerank"]}개 발견).',
         (
@@ -832,6 +989,27 @@ def render_graphrag_panel(result):
         ),
     ]
     with st.expander("🔧 기술적으로 어떻게 처리됐는지 보기"):
+        if result["entity_results"]:
+            # 멘션별로 어느 엔티티에 매칭됐는지(Exact/Alias/Word Boundary/Fuzzy
+            # 캐스케이드 결과) 보여줌 -- entity_results는 이미 계산돼 있었고
+            # .entity-chip/.entity-item/.entity-name/.entity-quote도 이미 CSS만
+            # 정의된 채 아무 데도 안 쓰이고 있었음(재감사(critique)에서 발견 --
+            # 파이프라인을 직접 디버깅하는 연구자 본인에게 필요한 바로 그 정보인데
+            # 화면엔 매칭 개수 합계만 나왔었음, 2026-07-16).
+            entity_items_html = '<div class="panel">'
+            for er in result["entity_results"]:
+                matches_text = (
+                    ", ".join(f'{m["name"]} ({m["type"]})' for m in er["matches"])
+                    if er["matches"] else "매칭 없음"
+                )
+                entity_items_html += (
+                    '<div class="entity-item">'
+                    f'<span class="entity-chip">MENTION</span><span class="entity-name">{er["mention"]}</span>'
+                    f'<div class="entity-quote">→ {matches_text}</div>'
+                    '</div>'
+                )
+            entity_items_html += '</div>'
+            st.markdown(entity_items_html, unsafe_allow_html=True)
         for i, s in enumerate(plain_steps, 1):
             st.markdown(f'<div class="step-item"><span class="step-num">{i:02d}</span><span>{s}</span></div>', unsafe_allow_html=True)
 
@@ -858,21 +1036,43 @@ def render_graphrag_panel(result):
         # 사실이 많은 질문(허브 인접 질문 등)은 근거가 수십 개까지 나올 수 있어
         # 페이지 전체 스크롤에 묻히기 쉽다 -- 자체 스크롤 영역으로 묶어 페이지
         # 스크롤과 분리(2026-07-16, UX 개선).
+
+        def _evidence_card_html(i, e):
+            quote = e["evidence"] or "(근거 문장 없음)"
+            tag = EVIDENCE_SOURCE_KO.get(e["evidence_source"], e["evidence_source"] or "")
+            return f"""
+                <div class="evidence-item">
+                    <div class="evidence-id">E{i:02d}</div>
+                    <div class="evidence-triple">{e['src_name']} → {e['relation']} → {e['dst_name']}</div>
+                    <div class="evidence-quote">"{quote}"</div>
+                    {f'<span class="evidence-tag">{tag}</span>' if tag else ''}
+                </div>
+                """
+
+        # 그래프에서 seed로부터 먼 사실을 흐리게 그리는 것과 같은 distances로,
+        # 근거 원장도 가까운 사실을 항상 보여주고 먼 사실은 접어 둔다(2026-07-16,
+        # 재재감사 -- 그래프는 이미 관련도 신호가 있는데 근거 원장 54개가 전부
+        # 같은 무게로 나와, 정작 답을 "검증"하는 화면에 신호가 없었음). 카드
+        # 텍스트를 opacity로 흐리는 대신 접기(progressive disclosure)를 쓴 이유:
+        # opacity로 흐리면 이미 재감사에서 실측된 대비 문제(WCAG AA)와 같은 종류의
+        # 실수를 evidence-quote/tag 텍스트에 새로 만들 위험이 있음.
+        near_edges, far_edges = [], []
+        for e in result["edges"]:
+            opacity = min(
+                _relevance_opacity(distances, e["src_name"]),
+                _relevance_opacity(distances, e["dst_name"]),
+            )
+            (near_edges if opacity >= 1.0 else far_edges).append(e)
+
         with st.container(height=480, border=False):
-            for i, e in enumerate(result["edges"], 1):
-                quote = e["evidence"] or "(근거 문장 없음)"
-                tag = EVIDENCE_SOURCE_KO.get(e["evidence_source"], e["evidence_source"] or "")
-                st.markdown(
-                    f"""
-                    <div class="evidence-item">
-                        <div class="evidence-id">E{i:02d}</div>
-                        <div class="evidence-triple">{e['src_name']} → {e['relation']} → {e['dst_name']}</div>
-                        <div class="evidence-quote">"{quote}"</div>
-                        {f'<span class="evidence-tag">{tag}</span>' if tag else ''}
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
+            for i, e in enumerate(near_edges, 1):
+                st.markdown(_evidence_card_html(i, e), unsafe_allow_html=True)
+            if far_edges:
+                with st.expander(
+                    f"관련도 낮은 근거 더 보기 ({len(far_edges)}개 — seed 개체에서 2단계 이상 떨어진 사실)"
+                ):
+                    for j, e in enumerate(far_edges, len(near_edges) + 1):
+                        st.markdown(_evidence_card_html(j, e), unsafe_allow_html=True)
 
 
 def render_rag_panel(result):
@@ -880,14 +1080,21 @@ def render_rag_panel(result):
         '<h3 class="compare-col-title">Naive RAG <span class="muted">문장 벡터 검색</span></h3>',
         unsafe_allow_html=True,
     )
+    # GraphRAG 패널과 마찬가지로 정답을 항상 최상단에 렌더링(2026-07-17, 재재재감사
+    # -- run_naive_rag_analysis()가 실제 유료 LLM 호출로 계산해 result["answer"]에
+    # 담아 반환하는데, 이 함수가 그 값을 어디에도 그리지 않아서 "모름"이든 실제
+    # 답이든 화면엔 검색된 문장만 보이고 결론은 아예 안 뜨는 상태였음).
     st.markdown(
         f"""
         <div class="card-cream">
-            <div style="font-size:0.75rem; font-weight:700;">답변</div>
-            <div style="font-size:1.15rem; font-weight:700; margin:10px 0 6px 0;">{_md_bold_to_html(result['answer'])}</div>
-            <div class="muted">검색어(영문 번역): {result['query_en']}</div>
+            <div class="answer-label">정답</div>
+            <div class="answer-text">{_md_bold_to_html(result['answer'])}</div>
         </div>
         """,
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f'<div class="muted" style="margin-bottom:14px;">검색어(영문 번역): {result["query_en"]}</div>',
         unsafe_allow_html=True,
     )
 
@@ -914,10 +1121,10 @@ def render_rag_panel(result):
 def render_result(item):
     st.markdown('<div class="section-label" style="margin-top:8px;">ANALYSIS COMPLETE</div>', unsafe_allow_html=True)
     st.markdown('<h2 style="margin:0;">분석 결과</h2>', unsafe_allow_html=True)
-    # 기본은 GraphRAG 탭만 보이게(st.tabs는 첫 탭이 기본 선택) -- naive RAG 결과는
-    # 이미 계산되어 있고(run_naive_rag_analysis가 GraphRAG와 함께 실행됨), "Naive RAG"
-    # 탭을 누를 때만 화면에 나타난다. 두 탭 모두 각각 단일 패널만 보여준다(비교는
-    # 탭을 오가며 확인).
+
+    # 요약 비교 행은 없앰 -- 사용자가 필요할 때 아래 탭을 눌러 직접 비교하므로
+    # 같은 답변을 두 번(요약 행 + 탭) 보여줄 필요가 없다는 사용자 피드백으로 제거
+    # (2026-07-17). 기본은 GraphRAG 탭만 보이고, Naive RAG는 탭을 눌러야 나타남.
     tab_graph, tab_rag = st.tabs(["GraphRAG", "Naive RAG"])
     with tab_graph:
         render_graphrag_panel(item["graphrag"])
@@ -980,7 +1187,15 @@ def main():
     render_hero()
     query, run_clicked = render_query_console()
 
-    if run_clicked and query.strip():
+    # 버튼을 빠르게 두 번 누르면(재감사에서 실측 재현: 더블클릭 -> "최근 분석"에
+    # 똑같은 질문이 3개 중복 생성) 매번 3회 샘플링 + Neo4j + 임베딩 호출이 그대로
+    # 다시 도는 실제 비용 버그였음(2026-07-16, 재감사에서 발견). Streamlit은 각
+    # 클릭을 별개 재실행으로 처리해 st.button 자체엔 "처리 중 비활성화"가 없으므로,
+    # 직전 히스토리와 같은 질문이면 다시 돌리지 않고 그 결과를 그대로 재사용한다.
+    last_question = st.session_state.history[-1]["graphrag"]["question"] if st.session_state.history else None
+    if run_clicked and query.strip() and query.strip() == last_question:
+        st.session_state.active_result = st.session_state.history[-1]
+    elif run_clicked and query.strip():
         if not neo4j_online:
             render_error(
                 "Neo4j에 연결할 수 없습니다. 로컬은 .env, Streamlit Cloud는 앱 Secrets에 "
