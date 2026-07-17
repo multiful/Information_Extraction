@@ -1,14 +1,6 @@
 # 연구 계획서
 ## 문서 수준 관계 추출(Document-level Relation Extraction)을 통한 비정형 텍스트의 구조화 지식 자동 생성
 
-> **최종 업데이트**: 2026-07-17: 최종 발표자료(`1조_발표자료.pdf`) 기준으로 세 문제의 검증 상태를 전부 **완료**로 갱신 — 문제 ① GCN(F1 61.65) vs GAT(F1 62.02, **채택**), 문제 ② DREEAM(Ign F1 +1.2%p, **채택**) vs GREP(F1 +1.8%p) 비교 검증, 문제 ③ PU AT-Loss를 최종 파이프라인에 통합. Neo4j 지식그래프·GraphRAG Streamlit 대시보드 구축 및 배포 완료.
->
-> 이전 (2026-07-13): 지식 그래프 파이프라인(Neo4j 적재 + **Bloom 시각화**) 및 모델 구성 비교표(ATLOP 논문 vs Baseline 재현 vs RoBERTa+PU) 추가.
->
-> 2026-07-13: **기존 ATLOP 뼈대를 유지하면서 세 가지 문제(① 다단계 관계 추론 ② low-attention 정보 유실 ③ Adaptive Thresholding 고도화)를 해결해 최종 성능 개선을 검증**하는 프레임으로 전환. baseline 재현 완료 수치(dev F1 61.71 / Ign F1 59.86)와 각 문제의 진단 근거·해결 설계·검증 계획을 실제 진행 상황 기준으로 갱신.
->
-> 본 문서는 **Information Extraction** 프로젝트 정의(DocRED 데이터셋)에 맞춰 작성한 연구 계획서입니다.
-
 ---
 
 ## 1. Problem Definition
