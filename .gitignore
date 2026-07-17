@@ -49,3 +49,15 @@ ffy.ipynb
 
 # GraphRAG 고도화 실험용 LLM 응답 캐시 (재생성 가능)
 GraphRAG/.cache/
+
+# Neo4j KG export 산출물 (재생성 가능 — Neo4j가 source of truth, Scripts/kg/export_*.py로 재생성)
+/entities.csv
+/relations.csv
+/triples.csv
+/triples.jsonl
+/pinecone_upsert.jsonl
+/unresolved_multihop.jsonl
+/schema.sql
+
+# impeccable 스킬 critique 기록 (일회성, 재생성 가능)
+.impeccable/
