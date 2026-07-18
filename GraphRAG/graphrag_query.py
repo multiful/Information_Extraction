@@ -168,7 +168,7 @@ def extract_entities(question, repeat=0):
         prompt = (
             "다음 질문을 분석해 아래 형식의 JSON 객체 하나만 출력하세요 (다른 설명 없이):\n"
             '{"entities": ["..."], "relation_type": "..." 또는 null, "value": "..." 또는 null, '
-            '"entity_type": "..." 또는 null}\n\n'
+            '"entity_type": "..." 또는 null, "entity_hints": ["..." 또는 null, ...]}\n\n'
             "- entities: 지식그래프 탐색의 시작점이 될 고유명사(회사/기관/인물/지명 등). "
             "없으면 빈 배열. 그래프의 개체명은 원어(주로 영어)로 저장돼 있으므로, 질문에 "
             "한국어 표기로 나온 잘 알려진 고유명사는 널리 쓰이는 영어 정식 명칭으로 "
@@ -213,7 +213,16 @@ def extract_entities(question, repeat=0):
             "국가, TIME=시간표현, NUM=수량, MISC=그 외). value로 역검색하는 질문(예3)에서 "
             "결과가 어떤 종류여야 하는지 질문에 나와 있으면(예: '조직', '회사', '사람') "
             "그 타입으로 채우고, 명시돼 있지 않거나 relation_type/value 자체가 null이면 "
-            "null.\n\n"
+            "null.\n"
+            "- entity_hints: entities와 같은 길이의 배열, 각 원소는 그 위치의 entity가 "
+            "가리키는 종류를 다음 목록 중 하나로 추정하거나(질문 문맥상 애매할 수 있는 "
+            "이름일 때만) 그 외에는 null -- "
+            f"{', '.join(sorted(ENTITY_TYPES))}. 예: \"Amazon은 어디에 있어?\"에서 문맥상 "
+            "회사를 묻는 게 자연스러우면 entity_hints=[\"ORG\"] (그래프에 같은 이름의 "
+            "강/열대우림(LOC)과 회사(ORG)가 둘 다 있어 힌트 없이는 섞여 조회됨). 대부분의 "
+            "이름은 애초에 동명이인/동명이물 걱정이 없으므로(예: \"Roketsan\", \"Outotec\") "
+            "그런 경우는 null로 둘 것 -- 확신 없이 아무 타입이나 채우면 오히려 진짜 정답을 "
+            "걸러내 버릴 수 있음(과잉 추정 금지, 애매한 이름에만 채움).\n\n"
             f"질문: {question}"
         )
         # README "문제 8" -- temperature=0으로 답변 생성 비결정성을 줄임(완전한 결정성
@@ -227,6 +236,13 @@ def extract_entities(question, repeat=0):
         text = text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
         parsed = json.loads(text)
         entities = parsed.get("entities") or []
+        entity_hints = parsed.get("entity_hints") or []
+        # 길이가 안 맞으면(LLM이 배열을 빠뜨리거나 짧게 준 경우) 통째로 무시 -- 위치가
+        # 틀어진 힌트를 잘못된 entity에 붙이는 것보다 힌트 없이 기존 동작(전부 후보 유지)
+        # 으로 안전하게 폴백하는 게 나음.
+        if len(entity_hints) != len(entities):
+            entity_hints = [None] * len(entities)
+        entity_hints = [h if h in ENTITY_TYPES else None for h in entity_hints]
         relation_type = parsed.get("relation_type") or None
         if relation_type not in RELATION_TYPES:
             relation_type = None
@@ -235,7 +251,7 @@ def extract_entities(question, repeat=0):
         if entity_type not in ENTITY_TYPES:
             entity_type = None
         return {
-            "entities": entities, "relation_type": relation_type,
+            "entities": entities, "entity_hints": entity_hints, "relation_type": relation_type,
             "value": value, "entity_type": entity_type,
         }
 
@@ -281,16 +297,57 @@ def extract_entities(question, repeat=0):
     # 어차피 1번 호출되는 이 프롬프트에 그대로 얹음 -- 추가 호출/의존성 0개), entities 추출
     # 규칙에 "잘 알려진 고유명사는 영어 정식 명칭으로 정규화" 지시 + 예6(Samsung/CHAIRPERSON)
     # 추가. 확신 없는 이름은 원문 유지하도록 명시해 오번역으로 인한 오탐 방지(Fuzzy Match
-    # 단계가 최후 안전망으로 남음).
-    return cached(cache_key("parse_query_v8", CHAT_MODEL, question, repeat), compute)
+    # 단계가 최후 안전망으로 남음). v9(2026-07-17) -- "Amazon은 어디에 있어?"가
+    # find_seed_entities()에서 강/열대우림(LOC)과 회사(ORG) "Amazon"을 둘 다 seed로
+    # 잡아 서로 무관한 사실(콜롬비아/남미 지리 vs 회사 정보)이 한 컨텍스트에 섞이는 걸
+    # 실측 발견(이번엔 리랭킹이 우연히 회사 쪽을 골라 답은 맞았지만, 근본적으로 어느
+    # 쪽을 원하는지 구분할 방법이 없었음). entities는 단순 문자열 리스트라 개체별 타입
+    # 힌트를 못 실었으므로, entities와 같은 길이의 entity_hints 배열을 새로 추가(entities
+    # 자체의 스키마/기존 소비 코드는 그대로 -- 인덱스로 짝지어 쓰는 방식이라 하위 호환).
+    # 애매하지 않은 대다수 이름(Roketsan, Outotec 등)에는 굳이 채우지 말라고 명시 --
+    # v4의 entity_type처럼 "결과가 속해야 할 종류가 명확할 때만" 채우는 절제된 원칙 재사용,
+    # 안 그러면 확신 없는 타입 추정이 오히려 진짜 정답 후보를 걸러낼 위험이 있음.
+    # v10(2026-07-17) -- v9는 entity_hints 설명을 entities 바로 다음(relation_type보다
+    # 앞)에 끼워 넣었는데, 이 위치 변경만으로 "Apple이 만든 제품은 뭐가 있어?"의
+    # relation_type 분류가 PRODUCT_OR_MATERIAL_PRODUCED(1-hop, 2.4초)에서 null(BFS,
+    # 11.4초)로 바뀌는 걸 실측 발견 -- relation_type 지시문 자체는 한 글자도 안 건드렸는데
+    # 순서만으로 값이 달라짐(4회 반복 재현, 온도 무관하게 안정적으로 바뀜 -- 노이즈가
+    # 아니라 프롬프트 구조 자체의 영향). "성능 저하 없이" 조건이 있어 롤백 대신
+    # entity_hints 설명을 entity_type 뒤(질문 직전)로 옮겨 기존 entities/relation_type/
+    # value/entity_type 블록의 인접 순서를 v8과 동일하게 복원 -- 재실측으로 해당 질문이
+    # 다시 PRODUCT_OR_MATERIAL_PRODUCED/1-hop으로 돌아오는 것 확인.
+    return cached(cache_key("parse_query_v10", CHAT_MODEL, question, repeat), compute)
 
 
-# DocRED 주석이 국가 '수반'을 HEAD_OF_STATE와 HEAD_OF_GOVERNMENT에 비일관적으로 나눠
-# 넣음 -- 실측(2026-07-16): 미국 대통령은 전부 HEAD_OF_GOVERNMENT, 필리핀 대통령은
-# HEAD_OF_STATE. LLM이 "대통령"을 의미상 맞는 HEAD_OF_STATE로 뽑아도 미국은 1-hop이
-# 사실을 못 찾고 BFS 폴백->"모름"으로 무너졌음(사용자 지적). 프롬프트로 한쪽 라벨을
-# 고르면 다른 나라가 깨지므로(데이터가 양쪽에 흩어짐), 둘 중 하나가 나오면 둘 다 조회.
-LEADER_RELATIONS = {"HEAD_OF_STATE", "HEAD_OF_GOVERNMENT"}
+# 같은 실세계 사실을 DocRED가 서로 다른 relation label로 흩어 놓는 그룹들 -- 1-hop
+# 질문이 그중 하나로 분류돼도 그룹 전체를 같이 조회해야 사실을 안 놓친다. 실측으로
+# 확인된 그룹만 추가(다른 관계까지 전부 추측성으로 짝짓는 건 과잉 설계).
+#
+# HEAD_OF_STATE / HEAD_OF_GOVERNMENT (2026-07-16): DocRED 주석이 국가 '수반'을
+# 두 라벨에 비일관적으로 나눠 넣음 -- 미국 대통령은 전부 HEAD_OF_GOVERNMENT, 필리핀
+# 대통령은 HEAD_OF_STATE. LLM이 "대통령"을 의미상 맞는 HEAD_OF_STATE로 뽑아도 미국은
+# 1-hop이 사실을 못 찾고 BFS 폴백->"모름"으로 무너졌음(사용자 지적). 프롬프트로 한쪽
+# 라벨을 고르면 다른 나라가 깨지므로(데이터가 양쪽에 흩어짐), 둘 중 하나가 나오면
+# 둘 다 조회.
+#
+# PRODUCT_OR_MATERIAL_PRODUCED / MANUFACTURER (2026-07-17): "삼성의 물건은 무엇들이
+# 있어?" 질문이 relation_type=PRODUCT_OR_MATERIAL_PRODUCED로 분류돼 1-hop이 Galaxy S
+# 1건만 찾고 멈춤(1-hop이 뭐라도 찾으면 BFS 폴백을 안 타는 설계라 그대로 종료) --
+# 사용자가 "전엔 여러 개 나왔는데"라고 지적해 실측: Samsung Galaxy Note/S9/S9+는
+# 전부 "제품 -[MANUFACTURER]-> Samsung"(반대 방향) 라벨로만 존재하고, 같은 제품
+# 개념을 회사 관점(PRODUCT_OR_MATERIAL_PRODUCED)/제품 관점(MANUFACTURER)으로 다르게
+# 인코딩한 것. 위 HEAD_OF_STATE 케이스와 동일한 근본 원인(DocRED 라벨 비일관성).
+RELATION_GROUPS = [
+    {"HEAD_OF_STATE", "HEAD_OF_GOVERNMENT"},
+    {"PRODUCT_OR_MATERIAL_PRODUCED", "MANUFACTURER"},
+]
+
+
+def _relation_group(relation_type):
+    for group in RELATION_GROUPS:
+        if relation_type in group:
+            return group
+    return {relation_type}
 
 
 def relation_lookup(session, seed_ids, relation_type):
@@ -298,10 +355,10 @@ def relation_lookup(session, seed_ids, relation_type):
     핵심 설계 결정 3). expand_subgraph()의 BFS와 달리 딱 그 관계 하나만 보므로
     사실이 하나만 나와도 곧장 답변에 쓸 수 있다 -- relation_type은 반드시 호출 전에
     RELATION_TYPES 화이트리스트 검증을 거쳐야 함(Cypher 관계 타입은 파라미터로
-    못 넘기고 문자열 삽입해야 하므로). LEADER_RELATIONS 계열이면 한 쌍을 함께 조회한다."""
+    못 넘기고 문자열 삽입해야 하므로). RELATION_GROUPS 계열이면 그룹 전체를 함께 조회한다."""
     if relation_type not in RELATION_TYPES or not seed_ids:
         return []
-    rels = LEADER_RELATIONS if relation_type in LEADER_RELATIONS else {relation_type}
+    rels = _relation_group(relation_type)
     rel_pattern = "|".join(sorted(rels))  # 전부 RELATION_TYPES 검증 통과분이라 인젝션 안전
     query = f"""
     MATCH (h:ZEntity)-[r:{rel_pattern}]-(n:ZEntity)
@@ -381,14 +438,31 @@ def _fuzzy_match_entities(session, mention):
     ]
 
 
-def find_seed_entities(session, mention):
+def _filter_by_type_hint(rows, mention_type):
+    """mention_type이 주어졌고 그 타입과 일치하는 후보가 하나라도 있으면 그것만 남기고,
+    하나도 없으면(힌트가 틀렸거나 무관) 원래 후보를 그대로 반환 -- 확신 없는 필터링으로
+    진짜 정답 후보를 지워버리는 것보다 "필터링 안 함"이 항상 안전한 폴백(2026-07-17,
+    Amazon 강(LOC)/회사(ORG) 동명이물 사례로 추가)."""
+    if not mention_type:
+        return rows
+    filtered = [r for r in rows if r["type"] == mention_type]
+    return filtered if filtered else rows
+
+
+def find_seed_entities(session, mention, mention_type=None):
     """README "문제 3" 해결 방안 -- Exact -> Alias -> Word Boundary -> Fuzzy Match
     cascade(Priority-based Entity Linking). 앞 단계에서 하나라도 찾으면 그 즉시
     채택하고 뒤 단계는 시도하지 않는다(정확도가 높은 매치를 우선). 기존 CONTAINS
     부분일치는 "Ankara" 질의가 "Vinod Mankara"/"Sankara"까지 오탐으로 잡던 문제가
     있어 폐기 -- Word Boundary 단계(정규식 \\b)로 대체하면 이 오탐이 사라지는 것을
     실측 검증함. LLM은 안 씀(질의당 최소 1회 호출돼 트래픽이 높을 수 있어 비용/속도상
-    결정론적 방법만 사용, README 설계 결정)."""
+    결정론적 방법만 사용, README 설계 결정).
+
+    mention_type(선택, extract_entities()의 entity_hints에서 옴): 이름은 같고 타입이
+    다른 개체가 그래프에 여러 개 있을 때(예: "Amazon"이 강(LOC)과 회사(ORG) 둘 다 존재)
+    구분하는 힌트. 각 단계에서 후보를 찾은 "직후"에만 적용하고 검색 자체를 좁히지는
+    않음 -- Cypher 쿼리/round-trip 수는 그대로라 지연시간에 영향 없음(오히려 seed 수가
+    줄어 이후 BFS 후보군이 작아지므로 그만큼 더 빨라질 수 있음)."""
     # 1단계: Exact Match -- 정규화된 질의 멘션과 name이 완전히 일치.
     rows = list(session.run(
         """
@@ -398,7 +472,7 @@ def find_seed_entities(session, mention):
         mention=mention, limit=SEEDS_PER_MENTION,
     ))
     if rows:
-        return rows
+        return _filter_by_type_hint(rows, mention_type)
 
     # 2단계: Alias Match -- aliases 리스트에 완전히 일치하는 표현이 있으면 채택.
     rows = list(session.run(
@@ -409,7 +483,7 @@ def find_seed_entities(session, mention):
         mention=mention, limit=SEEDS_PER_MENTION,
     ))
     if rows:
-        return rows
+        return _filter_by_type_hint(rows, mention_type)
 
     # 3단계: Word Boundary Match -- \b 단어 경계 정규식(대소문자 무시). Cypher =~는
     # 전체 문자열 매치(Java Pattern.matches와 동일)라 앞뒤에 .*를 둬야 "포함" 의미가
@@ -424,10 +498,10 @@ def find_seed_entities(session, mention):
         pattern=pattern, limit=SEEDS_PER_MENTION,
     ))
     if rows:
-        return rows
+        return _filter_by_type_hint(rows, mention_type)
 
     # 4단계: Fuzzy Match -- 오타 대응 최후 수단.
-    return _fuzzy_match_entities(session, mention)
+    return _filter_by_type_hint(_fuzzy_match_entities(session, mention), mention_type)
 
 
 def expand_subgraph(session, seed_ids):
@@ -699,6 +773,7 @@ def answer_question(question, repeat=0, verbose=True):
     "bfs"/"no_seed") -- A/B 테스트에서 라우팅 자체가 의도대로 갈리는지 확인하는 용도."""
     parsed = extract_entities(question, repeat=repeat)
     mentions = parsed["entities"]
+    entity_hints = parsed["entity_hints"]
     relation_type = parsed["relation_type"]
     value = parsed["value"]
     entity_type = parsed["entity_type"]
@@ -706,8 +781,8 @@ def answer_question(question, repeat=0, verbose=True):
     with driver.session(database=NEO4J_DATABASE) as session:
         seed_ids = []
         seed_names = []
-        for mention in mentions:
-            for row in find_seed_entities(session, mention):
+        for mention, hint in zip(mentions, entity_hints):
+            for row in find_seed_entities(session, mention, mention_type=hint):
                 seed_ids.append(row["id"])
                 seed_names.append(f"{row['name']} ({row['id']})")
 
